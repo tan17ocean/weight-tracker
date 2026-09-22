@@ -2,7 +2,7 @@
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import './styles/main.css'
 import {
-  store, stats, syncLabel, CFG,
+  store, stats, progress, syncLabel, CFG,
   getToken, setToken, pushRemote, pullAndMerge,
   addOrUpdateRecord, deleteRecord, saveSettings, importData, exportData, normalize
 } from './store'
@@ -78,6 +78,54 @@ function saveGoalHeight() {
   if (settings.height !== '' && !(h >= 80 && h <= 250)) { alert('身高无效（80 - 250 cm）'); return }
   saveSettings(settings.goal === '' ? null : g, settings.height === '' ? null : h)
   alert('设置已保存')
+}
+
+/* ---------- 减肥进度：目标体重内联编辑 ---------- */
+const editingGoal = ref(false)
+const goalInput = ref('')
+const goalSaving = ref(false)
+const hasGoalSet = computed(() => store.goal !== null && store.goal > 0)
+const pctClamped = computed(() => (progress.value ? Math.min(100, Math.max(0, progress.value.pct)) : 0))
+const progClass = computed(() => {
+  if (!progress.value) return ''
+  if (progress.value.reached) return 'prog-done'
+  if (pctClamped.value >= 80) return 'prog-high'
+  if (pctClamped.value >= 40) return 'prog-mid'
+  return 'prog-low'
+})
+const over = computed(() => {
+  if (!progress.value || !progress.value.reached) return 0
+  const total = Math.abs(progress.value.goal - progress.value.start)
+  return Math.max(0, Math.abs(progress.value.done) - total)
+})
+const progDoneCls = computed(() => {
+  if (!progress.value || progress.value.direction === 'keep') return ''
+  const good = progress.value.direction === 'lose' ? progress.value.done > 0 : progress.value.done < 0
+  return good ? 'down' : 'up'
+})
+const progDoneText = computed(() => {
+  if (!progress.value) return ''
+  const sign = progress.value.done >= 0 ? '+' : '-'
+  return `${sign}${Math.abs(progress.value.done).toFixed(1)} kg`
+})
+function startGoalEdit() {
+  editingGoal.value = true
+  goalInput.value = store.goal !== null ? store.goal : ''
+}
+function saveGoal() {
+  if (goalSaving.value) return
+  const g = parseFloat(goalInput.value)
+  if (goalInput.value === '') {
+    if (!confirm('清空目标体重？')) return
+    goalInput.value = ''
+    saveSettings(null, store.height)
+  } else {
+    if (!(g >= 20 && g <= 300)) { alert('目标体重无效（20 - 300 kg）'); return }
+    saveSettings(g, store.height)
+  }
+  editingGoal.value = false
+  goalSaving.value = true
+  setTimeout(() => { goalSaving.value = false }, 500)
 }
 
 /* ---------- Token ---------- */
@@ -319,6 +367,83 @@ onMounted(() => {
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- 减肥进度 -->
+    <div class="card prog-card">
+      <div class="prog-head">
+        <h3 class="card-title" style="margin-bottom:0;"><i>🎯</i>减肥进度</h3>
+        <div class="prog-goal" v-if="hasGoalSet">
+          <template v-if="!editingGoal">
+            <span class="prog-goal-num">目标 <b>{{ store.goal }}</b> kg</span>
+            <button class="btn small" @click="startGoalEdit">修改</button>
+          </template>
+          <template v-else>
+            <input type="number" id="inGoalInline" v-model="goalInput" min="20" max="300" step="0.1" placeholder="目标体重 kg" @keyup.enter="saveGoal">
+            <button class="btn small primary" @click="saveGoal">保存</button>
+            <button class="btn small" @click="editingGoal = false">取消</button>
+          </template>
+        </div>
+        <button class="btn small" v-else @click="startGoalEdit">设置目标体重</button>
+      </div>
+
+      <div v-if="progress.empty || !hasGoalSet" class="prog-empty">
+        <template v-if="progress.empty">还没有记录，先添加第一条体重记录，再设置目标即可查看进度。</template>
+        <template v-else>
+          目标体重未设置。设置后即可查看减肥进度。当前体重 <b>{{ progress.cur.toFixed(1) }}</b> kg。
+        </template>
+        <div v-if="editingGoal && !hasGoalSet" class="prog-inline">
+          <input type="number" id="inGoalInline" v-model="goalInput" min="20" max="300" step="0.1" placeholder="目标体重（kg）" @keyup.enter="saveGoal">
+          <button class="btn small primary" @click="saveGoal">保存目标</button>
+          <button class="btn small" @click="editingGoal = false">取消</button>
+        </div>
+      </div>
+
+      <template v-else>
+        <div class="prog-bar-wrap">
+          <div class="prog-bar" :class="progClass">
+            <div class="prog-fill" :style="{ width: pctClamped + '%' }"></div>
+            <span class="prog-pct">{{ Math.round(pctClamped) }}%</span>
+          </div>
+        </div>
+        <div class="prog-meta">
+          <div class="prog-point">
+            <span class="prog-label">起始</span>
+            <span class="prog-val">{{ progress.start.toFixed(1) }}</span>
+            <span class="prog-unit">kg</span>
+          </div>
+          <div class="prog-arrow">→</div>
+          <div class="prog-point">
+            <span class="prog-label">当前</span>
+            <span class="prog-val">{{ progress.cur.toFixed(1) }}</span>
+            <span class="prog-unit">kg</span>
+          </div>
+          <div class="prog-arrow">→</div>
+          <div class="prog-point">
+            <span class="prog-label">目标</span>
+            <span class="prog-val" :class="{ done: progress.reached }">{{ store.goal }}</span>
+            <span class="prog-unit">kg</span>
+          </div>
+        </div>
+        <div class="prog-stats">
+          <div class="prog-stat" v-if="progress.reached">
+            <span class="prog-stat-label">状态</span>
+            <span class="prog-badge done">🎉 目标已达成</span>
+          </div>
+          <div class="prog-stat">
+            <span class="prog-stat-label">{{ progress.direction === 'lose' ? '已减' : progress.direction === 'gain' ? '已增' : '变动' }}</span>
+            <span class="prog-stat-num" :class="progDoneCls">{{ progDoneText }}</span>
+          </div>
+          <div class="prog-stat" v-if="!progress.reached">
+            <span class="prog-stat-label">{{ progress.direction === 'lose' ? '还需减重' : progress.direction === 'gain' ? '还需增重' : '仍偏离' }}</span>
+            <span class="prog-stat-num">{{ progress.need.toFixed(1) }} kg</span>
+          </div>
+          <div class="prog-stat" v-else>
+            <span class="prog-stat-label">超额</span>
+            <span class="prog-stat-num down">{{ over.toFixed(1) }} kg</span>
+          </div>
+        </div>
+      </template>
     </div>
 
     <!-- 趋势图 -->

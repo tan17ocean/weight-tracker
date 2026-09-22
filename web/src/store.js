@@ -147,6 +147,33 @@ export const stats = computed(() => {
   return { empty: false, cards, sorted }
 })
 
+/* ---------- 减肥进度 ---------- */
+export const progress = computed(() => {
+  const sorted = state.records.slice().sort((a, b) => (a.date < b.date ? -1 : 1))
+  if (!sorted.length) return { empty: true, hasGoal: !!state.goal, goal: state.goal, cur: null, start: null, pct: 0, done: 0, need: 0, reached: false, direction: 'keep' }
+  const start = sorted[0].weight
+  const cur = sorted[sorted.length - 1].weight
+  const goal = state.goal
+  if (goal === null) {
+    return { empty: false, hasGoal: false, goal: null, cur, start, pct: 0, done: start - cur, need: 0, reached: false, direction: 'keep' }
+  }
+  const direction = goal < start ? 'lose' : goal > start ? 'gain' : 'keep'
+  const total = Math.abs(start - goal)
+  const done = start - cur
+  let pct = 0
+  if (direction === 'keep') {
+    pct = Math.abs(done) < 0.05 ? 100 : 0
+  } else if (direction === 'lose') {
+    pct = total === 0 ? 100 : Math.min(100, Math.max(0, (done / total) * 100))
+  } else {
+    pct = total === 0 ? 100 : Math.min(100, Math.max(0, ((cur - start) / total) * 100))
+  }
+  const reached = direction !== 'keep'
+    ? (direction === 'lose' ? cur <= goal : cur >= goal)
+    : Math.abs(done) < 0.05
+  return { empty: false, hasGoal: true, goal, cur, start, pct, done, need: Math.max(0, total - Math.abs(done)), reached, direction }
+})
+
 /* ---------- 同步状态 ---------- */
 function setSyncState(s, msg) {
   state.syncState = s
