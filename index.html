@@ -325,24 +325,40 @@
       return Promise.resolve(false);
     }
     setSyncState('syncing', '正在同步…');
-    var p = lastSha !== null ? Promise.resolve(lastSha) : getRemoteSha();
-    return p.then(function(){
-      var content = b64(JSON.stringify(data, null, 2));
-      var body = {message:'update weight data ' + todayStr(), content:content};
-      if(lastSha) body.sha = lastSha;
-      return fetch(CFG.api, {
-        method:'PUT',
-        headers:{Authorization:'Bearer ' + getToken(), Accept:'application/vnd.github+json', 'Content-Type':'application/json'},
-        body:JSON.stringify(body)
-      });
-    }).then(function(res){
-      if(!res.ok){
-        return res.json().catch(function(){ return null; }).then(function(er){
-          throw new Error((er && er.message) || ('HTTP ' + res.status));
+    var attempt = 0;
+    function doPush(){
+      var p = lastSha !== null ? Promise.resolve(lastSha) : getRemoteSha();
+      return p.then(function(){
+        var content = b64(JSON.stringify(data, null, 2));
+        var body = {message:'update weight data ' + todayStr(), content:content};
+        if(lastSha) body.sha = lastSha;
+        return fetch(CFG.api, {
+          method:'PUT',
+          headers:{Authorization:'Bearer ' + getToken(), Accept:'application/vnd.github+json', 'Content-Type':'application/json'},
+          body:JSON.stringify(body)
         });
-      }
-      return res.json();
-    }).then(function(j){
+      }).then(function(res){
+        // 服务器 5xx 属瞬时故障：指数退避自动重试（最多 3 次）
+        if(res.status >= 500 && attempt < 3){
+          attempt++;
+          setSyncState('syncing', '服务器繁忙（HTTP ' + res.status + '），第 ' + attempt + '/3 次重试…');
+          return new Promise(function(r){ setTimeout(r, 1500 * attempt); }).then(doPush);
+        }
+        if(!res.ok){
+          return res.json().catch(function(){ return null; }).then(function(er){
+            var reason = (er && (er.message || er.documentation_url)) || ('HTTP ' + res.status);
+            if(res.status === 401) throw new Error('HTTP 401：Token 无效或已过期，请重新生成并粘贴');
+            if(res.status === 403 && /rate/i.test(reason)) throw new Error('HTTP 403：GitHub API 限流，请稍后重试');
+            if(res.status === 403) throw new Error('HTTP 403：Token 权限不足（需勾选 Contents: Read and write）');
+            if(res.status === 404) throw new Error('HTTP 404：Token 未授权该仓库（需选择 weight-tracker）');
+            if(res.status === 500) throw new Error('HTTP 500：GitHub 服务器异常，自动重试后仍失败，请稍后再试');
+            throw new Error(reason);
+          });
+        }
+        return res.json();
+      });
+    }
+    return doPush().then(function(j){
       lastSha = j.content && j.content.sha;
       setSyncState('ok', '已同步上线 · ' + todayStr());
       return true;
