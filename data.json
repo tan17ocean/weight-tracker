@@ -1,11 +1,5 @@
 {
-  "records": [
-    {
-      "date": "2026-09-22",
-      "weight": 74.5,
-      "note": "用户环境复现"
-    }
-  ],
-  "goal": 70,
-  "height": 175
+  "records": [],
+  "goal": null,
+  "height": null
 }
