@@ -5,6 +5,7 @@ import { reactive, computed } from 'vue'
 const LS_KEY = 'weight-log-data-v1'
 const TOKEN_KEY = 'wt_gh_token'
 const UID_KEY = 'wt_user_id'
+const FIRST_USER_KEY = 'wt_first_user' // 本机第一个设置昵称的用户：唯一允许继承旧数据的用户
 
 export const CFG = {
   owner: 'tan17ocean',
@@ -76,10 +77,17 @@ export function setUserId(uid) {
   } catch (e) { /* ignore */ }
   return safe
 }
-// 切换当前用户：写入身份 → 重载该用户的本地数据（首次自动迁移旧共享数据）→ 重置远端 sha 缓存
+// 切换当前用户：写入身份 → 重载该用户的本地数据 → 重置远端 sha 缓存
+// 旧数据（本机旧共享键 / 线上旧公开 data.json）只有本机「第一个设置昵称的用户」允许继承一次；
+// 改名或清除后重设昵称时本地数据从零开始，云端文件同样只写入该用户自己的数据。
 export function switchUser(uid) {
+  const prev = getUserId()
   const safe = setUserId(uid)
-  const data = loadLocal()
+  if (!prev && !!safe && !firstUser()) {
+    // 本机首次设置昵称：固定记录为首用户，之后任何昵称（含清除后重设）都不再继承旧数据
+    try { localStorage.setItem(FIRST_USER_KEY, safe) } catch (e) { /* ignore */ }
+  }
+  const data = loadLocal(!prev && !!safe)
   state.records = data.records
   state.goal = data.goal
   state.height = data.height
@@ -92,14 +100,20 @@ function localKey() {
   const uid = getUserId()
   return uid ? `${LS_KEY}:${uid}` : LS_KEY
 }
-function loadLocal() {
+function firstUser() {
+  try { return localStorage.getItem(FIRST_USER_KEY) || '' } catch (e) { return '' }
+}
+function loadLocal(allowLegacy) {
   let raw = null
   try { raw = localStorage.getItem(localKey()) } catch (e) { /* ignore */ }
-  if (!raw && getUserId()) {
-    // 首次按用户读取：若存在旧版共享数据，将其迁移为该用户的初始数据
+  if (!raw && getUserId() && allowLegacy) {
+    // 本机首次设置昵称：将旧版共享数据搬移到该用户键，并删除旧键确保旧数据只继承一次
     try {
       raw = localStorage.getItem(LS_KEY)
-      if (raw) localStorage.setItem(localKey(), raw)
+      if (raw) {
+        localStorage.setItem(localKey(), raw)
+        localStorage.removeItem(LS_KEY)
+      }
     } catch (e) { /* ignore */ }
   }
   if (raw) {
@@ -296,10 +310,11 @@ export function pushRemote() {
   const doPush = () => {
     const p = lastSha !== null ? Promise.resolve(lastSha) : getRemoteSha()
     return p
-      .then(() => {
+.then(() => {
         const payload = { records: state.records, goal: state.goal, height: state.height }
-        if (lastSha === null) {
-          // 首次写入：合并旧版公开 data.json，保证历史数据迁移不丢
+        if (lastSha === null && uid === firstUser()) {
+          // 目标文件不存在 且 当前用户是本机首个用户：合并旧版公开 data.json，保证历史数据迁移不丢
+          // （改名/其他用户新建文件时一律不合并，数据从零开始）
           return fetch(CFG.legacyRaw, { cache: 'no-store' })
             .then((res) => (res.ok ? res.json() : null))
             .catch(() => null)
