@@ -1,5 +1,21 @@
 {
-  "records": [],
-  "goal": null,
-  "height": null
+  "records": [
+    {
+      "date": "2026-09-20",
+      "weight": 75.2,
+      "note": "E2E-A"
+    },
+    {
+      "date": "2026-09-21",
+      "weight": 74.8,
+      "note": "E2E-B"
+    },
+    {
+      "date": "2026-09-22",
+      "weight": 74.5,
+      "note": "E2E-C"
+    }
+  ],
+  "goal": 70,
+  "height": 175
 }
