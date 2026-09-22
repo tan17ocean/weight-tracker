@@ -2,8 +2,8 @@
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import './styles/main.css'
 import {
-  store, stats, progress, syncLabel, CFG,
-  getToken, setToken, pushRemote, pullAndMerge,
+  store, stats, progress, syncLabel,
+  pushRemote, pullAndMerge,
   getUserId, switchUser,
   addOrUpdateRecord, deleteRecord, saveSettings, importData, exportData, normalize
 } from './store'
@@ -151,32 +151,9 @@ function clearUid() {
   store.syncState = 'local'
 }
 
-/* ---------- Token ---------- */
-const tokenInput = ref('')
-const hasToken = computed(() => !!getToken())
-function saveToken() {
-  const t = tokenInput.value.trim()
-  if (!t) { alert('请输入 Token'); return }
-  setToken(t)
-  tokenInput.value = ''
-  if (uid.value && store.records.length) pushRemote()
-  else setSyncStateLocal('Token 已保存，提交数据后自动上线同步')
-}
-function setSyncStateLocal(msg) {
-  // 简单状态提示（无 token 时不改变大类状态）
-  store.syncMsg = msg
-  store.syncState = 'local'
-}
-function clearToken() {
-  if (!confirm('清除后本浏览器将无法自动上传数据，确认清除？')) return
-  setToken('')
-  store.syncMsg = 'Token 已清除，仅保留本地数据'
-  store.syncState = 'local'
-}
-
+/* ---------- 同步（经 Cloudflare Worker 代理，无需任何 Token） ---------- */
 function manualSync() {
   if (!uid.value) { openSync('inUid'); return }
-  if (!getToken()) { openSync('inToken'); return }
   pushRemote()
 }
 function openSync(focusId) {
@@ -184,7 +161,7 @@ function openSync(focusId) {
   setTimeout(() => document.getElementById(focusId || 'inUid')?.focus(), 50)
 }
 const syncPanel = ref(false)
-function openSyncPanel() { openSync(uid.value ? 'inToken' : 'inUid') }
+function openSyncPanel() { openSync('inUid') }
 
 /* ---------- 导入 ---------- */
 const fileInput = ref(null)
@@ -361,10 +338,10 @@ onMounted(() => {
           </div>
         </details>
 
-        <details :open="syncPanel" @toggle="syncPanel = $event.target.open">
-          <summary>数据同步（GitHub 私有仓库）</summary>
+<details :open="syncPanel" @toggle="syncPanel = $event.target.open">
+          <summary>数据同步（自动云端，无需配置）</summary>
           <div class="setting-body">
-            <div class="hint">设置昵称后，数据会写入私有仓库 <code>{{ CFG.owner }}/{{ CFG.dataRepo }}</code> 中你自己的文件（<code>data/users/{{ uid || '昵称' }}.json</code>），每个昵称彼此隔离、仅自己可见；未设置昵称或未配置 Token 时自动降级为本地模式（仅存本机浏览器）。</div>
+            <div class="hint">设置昵称后，数据会自动同步到云端私有仓库中你自己的文件（<code>data/users/{{ uid || '昵称' }}.json</code>），每个昵称彼此隔离、仅对应访问者自己可见。同步经 Cloudflare Worker 代理完成，<b>站点密钥与 GitHub Token 都只存在于服务端，任何访客（包括开发者工具）都看不到明文 Token</b>；未设置昵称时自动降级为本地模式（仅存本机浏览器）。</div>
             <div class="field">
               <label for="inUid">我的昵称（用户隔离标识）</label>
               <input type="text" id="inUid" v-model="uidInput" :placeholder="uid ? `当前：${uid}（输入新昵称后切换）` : '如：小陈'" maxlength="40" autocomplete="off">
@@ -373,16 +350,7 @@ onMounted(() => {
               <button class="btn small" @click="saveUid">保存昵称</button>
               <button class="btn small" v-if="uid" @click="clearUid">清除昵称</button>
             </div>
-            <div class="hint" v-if="uid">正在使用昵称 <b>{{ uid }}</b>，云端读写独立文件。</div>
-            <div class="field">
-              <label for="inToken">GitHub Token（仅授权 {{ CFG.dataRepo }} 仓库）</label>
-              <input type="password" id="inToken" v-model="tokenInput" placeholder="ghp_... / github_pat_..." autocomplete="off">
-            </div>
-            <div class="form-row-btns">
-              <button class="btn small" @click="saveToken">保存 Token</button>
-              <button class="btn small" v-if="hasToken" @click="clearToken">清除</button>
-            </div>
-            <div class="hint">安全建议：为此站生成 <b>Fine-grained Token</b>（仅授权私有仓库 <code>{{ CFG.dataRepo }}</code>、权限勾选 <code>Contents: Read and write</code>），不要使用高权限总 Token。Token 只保存在你当前浏览器，不会随网页公开。</div>
+            <div class="hint" v-if="uid">正在使用昵称 <b>{{ uid }}</b>，云端读写独立文件；每次保存数据后会自动同步，无需手动操作。</div>
           </div>
         </details>
       </div>

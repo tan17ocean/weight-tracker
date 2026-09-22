@@ -1,24 +1,32 @@
-// 数据层：本地缓存（按用户隔离）+ GitHub 私有仓库云端同步（每用户独立文件）
-// 键名兼容旧版：weight-log-data-v1（首个用户初始数据源）/ wt_gh_token / wt_user_id
+// 数据层：本地缓存（按用户隔离）+ Cloudflare Worker 代理云端同步（每用户独立文件）
+// GitHub Token 只存放在 Worker 服务端环境变量，前端完全不可见；
+// 前端仅持有 Worker 代理地址与站点密钥（密钥只用于代理鉴权，不会泄露 Token）。
+// 键名兼容旧版：weight-log-data-v1 / wt_user_id / wt_first_user
 import { reactive, computed } from 'vue'
 
 const LS_KEY = 'weight-log-data-v1'
-const TOKEN_KEY = 'wt_gh_token'
 const UID_KEY = 'wt_user_id'
 const FIRST_USER_KEY = 'wt_first_user' // 本机第一个设置昵称的用户：唯一允许继承旧数据的用户
 
+// 站点密钥：必须与 Worker 环境变量 SITE_KEY 完全一致（部署 Worker 时填入）
+const SITE_KEY = 'wtsk-891daa4c581a01097189e6a1'
+
 export const CFG = {
-  owner: 'tan17ocean',
+  // Cloudflare Worker 代理地址（已部署：weight-tracker-proxy）
+  proxy: 'https://weight-tracker-proxy.1515618169.workers.dev',
   dataRepo: 'weight-tracker-data', // 私有数据仓库：所有用户的云端数据只写这里
-  base: 'data/users',              // 每个用户一个文件
-  legacyRaw: 'https://raw.githubusercontent.com/tan17ocean/weight-tracker/main/data.json' // 旧版公开数据，仅首次迁移使用
+  legacyRaw: 'https://raw.githubusercontent.com/tan17ocean/weight-tracker/main/data.json' // 旧版公开数据，仅首个用户首次迁移使用
 }
 
-function filePath(uid) {
-  return `${CFG.base}/${encodeURIComponent(uid)}.json`
+function userApi(uid) {
+  return `${CFG.proxy}/users/${encodeURIComponent(uid)}.json`
 }
-function fileApi(uid) {
-  return `https://api.github.com/repos/${CFG.owner}/${CFG.dataRepo}/contents/${filePath(uid)}`
+function proxyHeaders() {
+  return { 'X-Site-Key': SITE_KEY, Accept: 'application/json' }
+}
+// 代理地址尚未替换为真实 Worker 域名时，视为云同步未就绪
+function proxyReady() {
+  return !/REPLACE_WITH_YOUR_WORKER/.test(CFG.proxy)
 }
 
 /* ---------- 数据规范化与合并（与旧版一致） ---------- */
@@ -77,7 +85,7 @@ export function setUserId(uid) {
   } catch (e) { /* ignore */ }
   return safe
 }
-// 切换当前用户：写入身份 → 重载该用户的本地数据 → 重置远端 sha 缓存
+// 切换当前用户：写入身份 → 重载该用户的本地数据
 // 旧数据（本机旧共享键 / 线上旧公开 data.json）只有本机「第一个设置昵称的用户」允许继承一次；
 // 改名或清除后重设昵称时本地数据从零开始，云端文件同样只写入该用户自己的数据。
 export function switchUser(uid) {
@@ -91,7 +99,6 @@ export function switchUser(uid) {
   state.records = data.records
   state.goal = data.goal
   state.height = data.height
-  lastSha = null
   return safe
 }
 
@@ -125,16 +132,6 @@ function saveLocal() {
   try { localStorage.setItem(localKey(), JSON.stringify({ records: state.records, goal: state.goal, height: state.height })) } catch (e) { /* ignore */ }
 }
 
-export function getToken() {
-  try { return localStorage.getItem(TOKEN_KEY) || '' } catch (e) { return '' }
-}
-export function setToken(t) {
-  try {
-    if (t) localStorage.setItem(TOKEN_KEY, t)
-    else localStorage.removeItem(TOKEN_KEY)
-  } catch (e) { /* ignore */ }
-}
-
 /* ---------- 响应式状态 ---------- */
 const state = reactive({
   ...loadLocal(),
@@ -143,8 +140,6 @@ const state = reactive({
 })
 
 export const store = state
-
-let lastSha = null
 
 export const stats = computed(() => {
   const sorted = state.records.slice().sort((a, b) => (a.date < b.date ? -1 : 1))
@@ -248,51 +243,30 @@ export const syncLabel = computed(() => {
   }
 })
 
-function b64(s) {
-  return btoa(unescape(encodeURIComponent(s)))
-}
-function b64decode(b64s) {
-  const bin = atob(b64s.replace(/\n/g, ''))
-  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
-  return new TextDecoder('utf-8').decode(bytes)
-}
-
-const ghHeaders = () => ({ Authorization: `Bearer ${getToken()}`, Accept: 'application/vnd.github+json' })
-
 function fetchRemote() {
   const uid = getUserId()
   if (!uid) return Promise.resolve(null)
-  return fetch(fileApi(uid), { headers: ghHeaders() })
+  return fetch(userApi(uid), { headers: proxyHeaders() })
     .then((res) => {
-      if (res.status === 401) throw new Error('Token 无效或已过期')
-      if (res.status === 403) throw new Error(`Token 未授权私有数据仓库（需勾选 ${CFG.dataRepo}）`)
-      if (res.status === 404) return null
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      return res.json().then((j) => {
-        lastSha = j.sha
-        return JSON.parse(b64decode(j.content))
-      })
+      if (!res.ok) {
+        return res.json().catch(() => null).then((er) => { throw new Error(why(res, er)) })
+      }
+      return res.json()
     })
-}
-
-function getRemoteSha() {
-  const uid = getUserId()
-  return fetch(fileApi(uid), { headers: ghHeaders() })
-    .then((res) => {
-      if (res.status === 404) { lastSha = null; return null }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      return res.json().then((j) => { lastSha = j.sha; return j.sha })
+    .then((j) => {
+      // Worker 约定：文件不存在时返回 { exists:false, records:[], goal:null, height:null }
+      if (!j || !j.exists) return null
+      return { records: j.records || [], goal: j.goal ?? null, height: j.height ?? null }
     })
 }
 
 const why = (res, er) => {
-  const reason = (er && (er.message || er.documentation_url)) || `HTTP ${res.status}`
-  if (res.status === 401) return 'HTTP 401：Token 无效或已过期，请重新生成并粘贴'
-  if (res.status === 403 && /rate/i.test(reason)) return 'HTTP 403：GitHub API 限流，请稍后重试'
-  if (res.status === 403) return 'HTTP 403：Token 权限不足（需勾选 Contents: Read and write）'
-  if (res.status === 404) return `HTTP 404：Token 未授权私有数据仓库 ${CFG.dataRepo}，或文件尚未创建（首次保存会自动创建）`
-  if (res.status === 500) return 'HTTP 500：GitHub 服务器异常，自动重试后仍失败，请稍后再试'
-  return reason
+  const msg = (er && (er.error || er.message)) || `HTTP ${res.status}`
+  if (res.status === 403) return 'HTTP 403：代理拒绝访问（站点密钥 SITE_KEY 不匹配，或 Worker 未部署）'
+  if (res.status === 502) return 'HTTP 502：GitHub 服务暂不可用，请稍后重试'
+  if (/rate/i.test(msg)) return 'HTTP 403：GitHub API 限流，请稍后重试'
+  if (/not found/i.test(msg)) return 'HTTP 404：私有数据仓库或用户文件不存在'
+  return msg
 }
 
 export function pushRemote() {
@@ -301,52 +275,50 @@ export function pushRemote() {
     setSyncState('local', '未设置用户昵称，数据仅保存在本机')
     return Promise.resolve(false)
   }
-  if (!getToken()) {
-    setSyncState('local', '未配置同步 Token（数据已存本地，可随时重试）')
+  if (!proxyReady()) {
+    setSyncState('local', '云同步未就绪：请先部署 Worker 并填入代理地址（数据已存本地）')
     return Promise.resolve(false)
   }
   setSyncState('syncing', '正在同步…')
-  let attempt = 0
-  const doPush = () => {
-    const p = lastSha !== null ? Promise.resolve(lastSha) : getRemoteSha()
-    return p
-.then(() => {
-        const payload = { records: state.records, goal: state.goal, height: state.height }
-        if (lastSha === null && uid === firstUser()) {
-          // 目标文件不存在 且 当前用户是本机首个用户：合并旧版公开 data.json，保证历史数据迁移不丢
-          // （改名/其他用户新建文件时一律不合并，数据从零开始）
-          return fetch(CFG.legacyRaw, { cache: 'no-store' })
-            .then((res) => (res.ok ? res.json() : null))
-            .catch(() => null)
-            .then((legacy) => (legacy ? mergeData(payload, normalize(legacy)) : payload))
-        }
-        return payload
-      })
-      .then((payload) => {
-        const content = b64(JSON.stringify(payload, null, 2))
-        const body = { message: `update weight data ${todayStr()}`, content }
-        if (lastSha) body.sha = lastSha
-        return fetch(fileApi(uid), {
-          method: 'PUT',
-          headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        })
-      })
-      .then((res) => {
+  // 先探测远端文件是否存在：不存在且是本机首个用户时，合并旧版公开 data.json，保证历史数据迁移不丢
+  return fetch(userApi(uid), { headers: proxyHeaders(), cache: 'no-store' })
+    .then((res) => {
+      if (!res.ok) return res.json().catch(() => null).then((er) => { throw new Error(why(res, er)) })
+      return res.json()
+    })
+    .then((j) => {
+      const payload = { records: state.records, goal: state.goal, height: state.height }
+      if ((!j || !j.exists) && uid === firstUser()) {
+        return fetch(CFG.legacyRaw, { cache: 'no-store' })
+          .then((res) => (res.ok ? res.json() : null))
+          .catch(() => null)
+          .then((legacy) => (legacy ? mergeData(payload, normalize(legacy)) : payload))
+      }
+      return payload
+    })
+    .then((payload) => {
+      let attempt = 0
+      const doPut = () => fetch(userApi(uid), {
+        method: 'PUT',
+        headers: { ...proxyHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then((res) => {
         if (res.status >= 500 && attempt < 3) {
           attempt++
           setSyncState('syncing', `服务器繁忙（HTTP ${res.status}），第 ${attempt}/3 次重试…`)
-          return new Promise((r) => setTimeout(r, 1500 * attempt)).then(doPush)
+          return new Promise((r) => setTimeout(r, 1500 * attempt)).then(doPut)
         }
-        if (!res.ok) {
-          return res.json().catch(() => null).then((er) => { throw new Error(why(res, er)) })
-        }
-        return res.json()
+        return res
       })
-  }
-  return doPush()
-    .then((j) => {
-      lastSha = j.content && j.content.sha
+      return doPut()
+    })
+    .then((res) => {
+      if (!res.ok) {
+        return res.json().catch(() => null).then((er) => { throw new Error(why(res, er)) })
+      }
+      return res.json()
+    })
+    .then(() => {
       setSyncState('ok', `已同步上线 · ${todayStr()}`)
       return true
     })
@@ -361,8 +333,8 @@ export function pullAndMerge() {
     setSyncState('local', '未设置用户昵称，先在顶部设置昵称即可云端隔离存储')
     return
   }
-  if (!getToken()) {
-    setSyncState('local', '未配置同步 Token（数据已存本地）')
+  if (!proxyReady()) {
+    setSyncState('local', '云同步未就绪：请部署 Cloudflare Worker 后自动开启（数据保存在本机）')
     return
   }
   fetchRemote()
@@ -370,23 +342,21 @@ export function pullAndMerge() {
       if (remote === null) {
         const dirty = state.records.length > 0
         setSyncState(dirty ? 'local' : 'ok', dirty ? '线上暂无数据，本地有内容待上传' : '线上暂无数据')
-        if (dirty && getToken()) pushRemote()
+        if (dirty) pushRemote()
         return
       }
       const rn = normalize(remote)
       const merged = mergeData({ records: state.records, goal: state.goal, height: state.height }, rn)
       const changed = !dataEq(merged, { records: state.records, goal: state.goal, height: state.height })
-      const hasToken = !!getToken()
       state.records = merged.records
       state.goal = merged.goal
       state.height = merged.height
       saveLocal()
       const localExtra = state.records.length > rn.records.length
       if (changed || localExtra || ((state.goal || state.height) && !rn.goal && !rn.height)) {
-        if (hasToken) pushRemote()
-        else setSyncState('local', '检测到未同步的本地数据，配置 Token 后自动上传')
+        pushRemote()
       } else {
-        setSyncState(hasToken ? 'ok' : 'local', hasToken ? `已从线上载入 ${rn.records.length} 条记录` : '已载入线上数据（未配置 Token）')
+        setSyncState('ok', `已从线上载入 ${rn.records.length} 条记录`)
       }
     })
     .catch((e) => {
