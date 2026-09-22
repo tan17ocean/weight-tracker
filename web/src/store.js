@@ -1,16 +1,23 @@
-// 数据层：本地缓存 + GitHub 云端同步
-// 键名与旧版完全兼容：weight-log-data-v1 / wt_gh_token
+// 数据层：本地缓存（按用户隔离）+ GitHub 私有仓库云端同步（每用户独立文件）
+// 键名兼容旧版：weight-log-data-v1（首个用户初始数据源）/ wt_gh_token / wt_user_id
 import { reactive, computed } from 'vue'
 
 const LS_KEY = 'weight-log-data-v1'
 const TOKEN_KEY = 'wt_gh_token'
+const UID_KEY = 'wt_user_id'
 
 export const CFG = {
   owner: 'tan17ocean',
-  repo: 'weight-tracker',
-  path: 'data.json',
-  raw: 'https://raw.githubusercontent.com/tan17ocean/weight-tracker/main/data.json',
-  api: 'https://api.github.com/repos/tan17ocean/weight-tracker/contents/data.json'
+  dataRepo: 'weight-tracker-data', // 私有数据仓库：所有用户的云端数据只写这里
+  base: 'data/users',              // 每个用户一个文件
+  legacyRaw: 'https://raw.githubusercontent.com/tan17ocean/weight-tracker/main/data.json' // 旧版公开数据，仅首次迁移使用
+}
+
+function filePath(uid) {
+  return `${CFG.base}/${encodeURIComponent(uid)}.json`
+}
+function fileApi(uid) {
+  return `https://api.github.com/repos/${CFG.owner}/${CFG.dataRepo}/contents/${filePath(uid)}`
 }
 
 /* ---------- 数据规范化与合并（与旧版一致） ---------- */
@@ -57,13 +64,51 @@ function fmtDate(d) {
 
 const todayStr = () => fmtDate(new Date())
 
-/* ---------- 本地存取 ---------- */
-function loadLocal() {
+/* ---------- 用户身份 ---------- */
+export function getUserId() {
+  try { return localStorage.getItem(UID_KEY) || '' } catch (e) { return '' }
+}
+export function setUserId(uid) {
+  const safe = String(uid || '').trim().slice(0, 40).replace(/[\\/:*?"<>|#%{}\s]/g, '')
   try {
-    const raw = localStorage.getItem(LS_KEY)
-    if (raw) return normalize(JSON.parse(raw))
+    if (safe) localStorage.setItem(UID_KEY, safe)
+    else localStorage.removeItem(UID_KEY)
   } catch (e) { /* ignore */ }
+  return safe
+}
+// 切换当前用户：写入身份 → 重载该用户的本地数据（首次自动迁移旧共享数据）→ 重置远端 sha 缓存
+export function switchUser(uid) {
+  const safe = setUserId(uid)
+  const data = loadLocal()
+  state.records = data.records
+  state.goal = data.goal
+  state.height = data.height
+  lastSha = null
+  return safe
+}
+
+/* ---------- 本地存取（按用户分键，兼容旧键迁移） ---------- */
+function localKey() {
+  const uid = getUserId()
+  return uid ? `${LS_KEY}:${uid}` : LS_KEY
+}
+function loadLocal() {
+  let raw = null
+  try { raw = localStorage.getItem(localKey()) } catch (e) { /* ignore */ }
+  if (!raw && getUserId()) {
+    // 首次按用户读取：若存在旧版共享数据，将其迁移为该用户的初始数据
+    try {
+      raw = localStorage.getItem(LS_KEY)
+      if (raw) localStorage.setItem(localKey(), raw)
+    } catch (e) { /* ignore */ }
+  }
+  if (raw) {
+    try { return normalize(JSON.parse(raw)) } catch (e) { /* ignore */ }
+  }
   return { records: [], goal: null, height: null }
+}
+function saveLocal() {
+  try { localStorage.setItem(localKey(), JSON.stringify({ records: state.records, goal: state.goal, height: state.height })) } catch (e) { /* ignore */ }
 }
 
 export function getToken() {
@@ -192,18 +237,33 @@ export const syncLabel = computed(() => {
 function b64(s) {
   return btoa(unescape(encodeURIComponent(s)))
 }
+function b64decode(b64s) {
+  const bin = atob(b64s.replace(/\n/g, ''))
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
+  return new TextDecoder('utf-8').decode(bytes)
+}
+
+const ghHeaders = () => ({ Authorization: `Bearer ${getToken()}`, Accept: 'application/vnd.github+json' })
 
 function fetchRemote() {
-  return fetch(`${CFG.raw}?t=${Date.now()}`)
+  const uid = getUserId()
+  if (!uid) return Promise.resolve(null)
+  return fetch(fileApi(uid), { headers: ghHeaders() })
     .then((res) => {
+      if (res.status === 401) throw new Error('Token 无效或已过期')
+      if (res.status === 403) throw new Error(`Token 未授权私有数据仓库（需勾选 ${CFG.dataRepo}）`)
       if (res.status === 404) return null
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      return res.json()
+      return res.json().then((j) => {
+        lastSha = j.sha
+        return JSON.parse(b64decode(j.content))
+      })
     })
 }
 
 function getRemoteSha() {
-  return fetch(CFG.api, { headers: { Authorization: `Bearer ${getToken()}`, Accept: 'application/vnd.github+json' } })
+  const uid = getUserId()
+  return fetch(fileApi(uid), { headers: ghHeaders() })
     .then((res) => {
       if (res.status === 404) { lastSha = null; return null }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -216,12 +276,17 @@ const why = (res, er) => {
   if (res.status === 401) return 'HTTP 401：Token 无效或已过期，请重新生成并粘贴'
   if (res.status === 403 && /rate/i.test(reason)) return 'HTTP 403：GitHub API 限流，请稍后重试'
   if (res.status === 403) return 'HTTP 403：Token 权限不足（需勾选 Contents: Read and write）'
-  if (res.status === 404) return 'HTTP 404：Token 未授权该仓库（需选择 weight-tracker）'
+  if (res.status === 404) return `HTTP 404：Token 未授权私有数据仓库 ${CFG.dataRepo}，或文件尚未创建（首次保存会自动创建）`
   if (res.status === 500) return 'HTTP 500：GitHub 服务器异常，自动重试后仍失败，请稍后再试'
   return reason
 }
 
 export function pushRemote() {
+  const uid = getUserId()
+  if (!uid) {
+    setSyncState('local', '未设置用户昵称，数据仅保存在本机')
+    return Promise.resolve(false)
+  }
   if (!getToken()) {
     setSyncState('local', '未配置同步 Token（数据已存本地，可随时重试）')
     return Promise.resolve(false)
@@ -232,12 +297,23 @@ export function pushRemote() {
     const p = lastSha !== null ? Promise.resolve(lastSha) : getRemoteSha()
     return p
       .then(() => {
-        const content = b64(JSON.stringify({ records: state.records, goal: state.goal, height: state.height }, null, 2))
+        const payload = { records: state.records, goal: state.goal, height: state.height }
+        if (lastSha === null) {
+          // 首次写入：合并旧版公开 data.json，保证历史数据迁移不丢
+          return fetch(CFG.legacyRaw, { cache: 'no-store' })
+            .then((res) => (res.ok ? res.json() : null))
+            .catch(() => null)
+            .then((legacy) => (legacy ? mergeData(payload, normalize(legacy)) : payload))
+        }
+        return payload
+      })
+      .then((payload) => {
+        const content = b64(JSON.stringify(payload, null, 2))
         const body = { message: `update weight data ${todayStr()}`, content }
         if (lastSha) body.sha = lastSha
-        return fetch(CFG.api, {
+        return fetch(fileApi(uid), {
           method: 'PUT',
-          headers: { Authorization: `Bearer ${getToken()}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+          headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         })
       })
@@ -265,11 +341,15 @@ export function pushRemote() {
     })
 }
 
-function saveLocal() {
-  localStorage.setItem(LS_KEY, JSON.stringify({ records: state.records, goal: state.goal, height: state.height }))
-}
-
 export function pullAndMerge() {
+  if (!getUserId()) {
+    setSyncState('local', '未设置用户昵称，先在顶部设置昵称即可云端隔离存储')
+    return
+  }
+  if (!getToken()) {
+    setSyncState('local', '未配置同步 Token（数据已存本地）')
+    return
+  }
   fetchRemote()
     .then((remote) => {
       if (remote === null) {

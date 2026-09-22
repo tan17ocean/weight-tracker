@@ -91,6 +91,11 @@ body {
 .brand b { font-size: 16px; font-weight: 700; letter-spacing: .2px; }
 .brand span { display: block; font-size: 11px; color: var(--text-muted); margin-top: -2px; }
 .spacer { flex: 1; }
+.user-chip {
+  max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-block; vertical-align: bottom; font-weight: 600;
+}
+.user-chip::before { content: '\1F464'; margin-right: 5px; font-weight: 400; }
 
 /* ---------- 按钮（胶囊风格） ---------- */
 .btn {
