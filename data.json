@@ -1,5 +1,11 @@
 {
-  "records": [],
+  "records": [
+    {
+      "date": "2026-09-22",
+      "weight": 80.6,
+      "note": ""
+    }
+  ],
   "goal": null,
   "height": null
 }
