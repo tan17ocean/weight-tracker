@@ -4,14 +4,11 @@
 // 作用：前端永远看不到 GitHub Token，读写私有数据仓库
 //       weight-tracker-data 的全部请求都经由此代理完成。
 //
-// 鉴权（主路径）：GitHub App（installation token 动态换取，永不过期）
+// 鉴权（唯一路径）：GitHub App（installation token 动态换取，永不过期）
 //   GH_APP_ID             : GitHub App ID（整数）
 //   GH_APP_INSTALLATION_ID: App 安装 ID（整数）
 //   GH_APP_PRIVATE_KEY    : App 私钥（PKCS8 PEM 全文，作为 Secret）
 //   Worker 用私钥签 JWT → 换取 installation token（1h 有效）→ 缓存至过期前 1 分钟
-//
-// 鉴权（过渡兜底）：GH_TOKEN（fine-grained PAT，90 天过期）仅在 App
-//   配置缺失或换取失败且 GH_TOKEN 仍存在时使用，上线后可移除。
 //
 // 需要配置的环境变量（Settings -> Variables and Secrets）：
 //   SITE_KEY (Secret) : 站点密钥，与前端内置值一致，防止代理被陌生人调用
@@ -20,7 +17,6 @@
 //   GH_APP_ID (Text)  : GitHub App ID
 //   GH_APP_INSTALLATION_ID (Text) : GitHub App 安装 ID
 //   GH_APP_PRIVATE_KEY (Secret)   : GitHub App 私钥（PKCS8 PEM）
-//   GH_TOKEN (Secret, 可选)       : 旧 fine-grained token（过渡兜底）
 //
 // 接口：
 //   GET  /users/<uid>.json 读取用户数据
@@ -110,32 +106,14 @@ async function getInstallToken() {
   return inflight
 }
 
-// 获取 GitHub 请求头：App token 为主路径，GH_TOKEN 为过渡兜底
+// 获取 GitHub 请求头：仅使用 GitHub App installation token（旧 GH_TOKEN 兜底已移除）
 async function getGhHeaders() {
-  if (appAuthConfigured()) {
-    try {
-      const t = await getInstallToken()
-      return {
-        Authorization: `Bearer ${t}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'weight-tracker-worker'
-      }
-    } catch (e) {
-      if (globalThis.GH_TOKEN) {
-        // 过渡兜底：App 换取失败且旧 token 仍在时继续服务
-        return legacyGhHeaders()
-      }
-      throw e
-    }
+  if (!appAuthConfigured()) {
+    throw new Error('github app auth not configured (GH_APP_ID / GH_APP_INSTALLATION_ID / GH_APP_PRIVATE_KEY)')
   }
-  if (globalThis.GH_TOKEN) return legacyGhHeaders()
-  throw new Error('no github auth configured (GH_APP_* or GH_TOKEN)')
-}
-
-function legacyGhHeaders() {
+  const t = await getInstallToken()
   return {
-    Authorization: `Bearer ${globalThis.GH_TOKEN}`,
+    Authorization: `Bearer ${t}`,
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': 'weight-tracker-worker'
@@ -144,9 +122,7 @@ function legacyGhHeaders() {
 
 // 当前实际生效的鉴权方式（供 /health 与错误信息使用）
 function authKind() {
-  if (appAuthConfigured()) return 'github-app'
-  if (globalThis.GH_TOKEN) return 'pat'
-  return 'none'
+  return appAuthConfigured() ? 'github-app' : 'none'
 }
 
 // ---------- 路由处理 ----------
@@ -211,7 +187,7 @@ async function handleRequest(request) {
     const path = `data/users/${encodeURIComponent(uid)}.json`
     const contentsUrl = `${GH_API}/repos/${owner}/${repo}/contents/${path}`
 
-    // 获取鉴权头（App 主路径，失败走 GH_TOKEN 兜底）
+    // 获取鉴权头（GitHub App installation token）
     let ghHeaders
     try {
       ghHeaders = await getGhHeaders()
