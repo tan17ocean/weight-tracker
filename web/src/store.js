@@ -3,6 +3,7 @@
 // 前端仅持有 Worker 代理地址与站点密钥（密钥只用于代理鉴权，不会泄露 Token）。
 // 键名兼容旧版：weight-log-data-v1 / wt_user_id / wt_first_user
 import { reactive, computed } from 'vue'
+import { buildXlsx } from './xlsx.js'
 
 const LS_KEY = 'weight-log-data-v1'
 const UID_KEY = 'wt_user_id'
@@ -508,26 +509,24 @@ export function saveSettings(goal, height) {
   pushRemote()
 }
 
-export function importData(records, goal, height) {
-  setStoreRecords(mergeRecords(state.records, records))
-  if (goal !== null) state.goal = goal
-  if (height !== null) state.height = height
-  saveLocal()
-  pushRemote()
-}
-
-// 兼容写回 store 中 records 的辅助函数
-function setStoreRecords(recs) {
-  state.records = recs
-}
-
 export function exportData() {
-  const blob = new Blob([JSON.stringify({ records: state.records, goal: state.goal, height: state.height }, null, 2)], { type: 'application/json' })
+  const recs = sortRecs(state.records) // 按日期升序导出，便于阅读
+  if (!recs.length) return false // 无记录不生成空文件
+  const headers = ['日期', '时间', '体重(kg)', '备注']
+  const rows = recs.map((r) => [
+    r.date,
+    r.ts != null ? fmtTime(r.ts) : '',
+    r.weight,
+    r.note || ''
+  ])
+  const buf = buildXlsx({ sheetName: '体重记录', headers, rows })
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
-  a.download = `weight-records-${todayStr()}.json`
+  a.download = `weight-tracker-${todayStr()}.xlsx`
   a.click()
   URL.revokeObjectURL(a.href)
+  return true
 }
 
 /* ---------- 断网恢复自动补推 ---------- */

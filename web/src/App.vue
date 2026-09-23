@@ -5,7 +5,7 @@ import {
   store, stats, progress, syncLabel,
   pushRemote, pullAndMerge,
   getUserId, switchUser, uidPersisted,
-  addRecord, updateRecord, deleteRecord, saveSettings, importData, exportData, normalize, sortRecs
+  addRecord, updateRecord, deleteRecord, saveSettings, exportData, sortRecs
 } from './store'
 import { getTheme, setTheme } from './theme'
 
@@ -203,24 +203,10 @@ function openSync(focusId) {
 const syncPanel = ref(false)
 function openSyncPanel() { openSync('inUid') }
 
-/* ---------- 导入 ---------- */
-const fileInput = ref(null)
-function onPickImport() { fileInput.value.click() }
-function onImport(ev) {
-  const f = ev.target.files[0]
-  ev.target.value = ''
-  if (!f) return
-  const rd = new FileReader()
-  rd.onload = () => {
-    try {
-      const d = JSON.parse(rd.result)
-      const nd = normalize({ records: d.records, goal: d.goal, height: d.height })
-      if (!nd.records.length && !d.records) { alert('导入失败：文件中没有有效的记录数据'); return }
-importData(nd.records, nd.goal, nd.height)
-      alert(`导入成功，共合并 ${nd.records.length} 条记录（按条合并，同日多条均保留）`)
-    } catch (e) { alert('导入失败：文件不是有效的 JSON 备份文件') }
-  }
-  rd.readAsText(f, 'utf-8')
+/* ---------- 导出 Excel ---------- */
+function onExport() {
+  const ok = exportData()
+  showToast(ok ? '已导出 Excel 文件' : '暂无记录可导出，先添加一条吧', ok ? 'ok' : 'error')
 }
 
 /* ---------- 列表相对日期 ---------- */
@@ -353,8 +339,7 @@ onMounted(() => {
       <button class="btn" @click="openSyncPanel" :title="uid ? `当前用户：${uid}（点击切换）` : '设置昵称后数据将按用户独立存入云端'">
         <span class="user-chip">{{ uid ? uid : '设置昵称' }}</span>
       </button>
-      <button class="btn" @click="exportData()">导出数据</button>
-      <button class="btn" @click="onPickImport">导入数据</button>
+<button class="btn" @click="onExport" title="导出全部记录为 Excel 文件">导出 Excel</button>
       <button class="btn" @click="manualSync" :title="store.syncMsg">
         <span class="dot" :class="store.syncState === 'ok' ? 'ok' : store.syncState === 'syncing' ? 'syncing' : store.syncState === 'error' ? 'error' : 'local'"></span>
         <span>{{ syncLabel }}</span>
@@ -366,9 +351,8 @@ onMounted(() => {
         <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
         </svg>
-        <span>主题</span>
+<span>主题</span>
       </button>
-      <input type="file" ref="fileInput" accept=".json,application/json" hidden @change="onImport">
     </div>
   </header>
 
