@@ -29,14 +29,25 @@ function proxyReady() {
   return !/REPLACE_WITH_YOUR_WORKER/.test(CFG.proxy)
 }
 
-/* ---------- 数据规范化与合并（与旧版一致） ---------- */
+/* ---------- 数据规范化与合并 ---------- */
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+// 记录唯一标识：新增时生成；旧数据（无 id）用内容拼出稳定值，同一条记录在本地/云端合并时不重复
+function genId() {
+  return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
 
 export function normalize(d) {
   const recs = Array.isArray(d && d.records)
     ? d.records
         .filter((r) => r && typeof r.date === 'string' && DATE_RE.test(r.date) && typeof r.weight === 'number' && isFinite(r.weight))
-        .map((r) => ({ date: r.date, weight: r.weight, note: typeof r.note === 'string' ? r.note : '' }))
+        .map((r) => ({
+          id: typeof r.id === 'string' && r.id ? r.id : `${r.date}|${r.weight}|${typeof r.note === 'string' ? r.note : ''}`,
+          date: r.date,
+          weight: r.weight,
+          note: typeof r.note === 'string' ? r.note : '',
+          ts: typeof r.ts === 'number' && isFinite(r.ts) ? r.ts : null // 录入时间戳(ms)；旧数据无则 null
+        }))
     : []
   return {
     records: recs,
@@ -45,11 +56,25 @@ export function normalize(d) {
   }
 }
 
+// 排序：日期升序 → 同日按录入时间升序（无时间的旧记录排最前）→ id 兜底
+function sortCmp(a, b) {
+  if (a.date !== b.date) return a.date < b.date ? -1 : 1
+  const ta = a.ts, tb = b.ts
+  if (ta !== tb) {
+    if (ta == null) return -1
+    if (tb == null) return 1
+    return ta - tb
+  }
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+export function sortRecs(recs) { return recs.slice().sort(sortCmp) }
+
+// 按 id 合并去重：同一 id 取新（incoming），不同 id 全部保留；不再按日期覆盖
 function mergeRecords(cur, incoming) {
   const map = {}
-  cur.forEach((r) => { map[r.date] = r })
-  incoming.forEach((r) => { map[r.date] = r }) // 同日期以新（incoming）为准
-  return Object.keys(map).sort().map((k) => map[k])
+  cur.forEach((r) => { map[r.id] = r })
+  incoming.forEach((r) => { map[r.id] = r })
+  return Object.keys(map).map((k) => map[k]).sort(sortCmp)
 }
 
 function mergeData(local, remote) {
@@ -69,6 +94,11 @@ function fmtDate(d) {
   const m = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')
   return `${y}-${m}-${day}`
+}
+// 录入时间（时:分），用于区分同日多条记录
+function fmtTime(t) {
+  const d = new Date(t)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 const todayStr = () => fmtDate(new Date())
@@ -142,7 +172,7 @@ const state = reactive({
 export const store = state
 
 export const stats = computed(() => {
-  const sorted = state.records.slice().sort((a, b) => (a.date < b.date ? -1 : 1))
+  const sorted = sortRecs(state.records)
   if (!sorted.length) return { empty: true, cards: [] }
   const last = sorted[sorted.length - 1]
   const prev = sorted.length > 1 ? sorted[sorted.length - 2] : null
@@ -167,12 +197,12 @@ export const stats = computed(() => {
   const maxW = Math.max(...ws)
   const minW = Math.min(...ws)
 
-  const cards = []
-  cards.push({ label: '当前体重', value: last.weight.toFixed(1), unit: 'kg', hint: `更新于 ${last.date.slice(5)}` })
+const cards = []
+  cards.push({ label: '当前体重', value: last.weight.toFixed(1), unit: 'kg', hint: `更新于 ${last.date.slice(5)}${last.ts != null ? ' ' + fmtTime(last.ts) : ''}` })
   if (prev) {
     const dLast = last.weight - prev.weight
     cards.push({
-      label: '较上次变化', value: fmtDiff(dLast), hint: `上次 ${prev.date.slice(5)}`,
+      label: '较上次变化', value: fmtDiff(dLast), hint: `上次 ${prev.date.slice(5)}${prev.ts != null ? ' ' + fmtTime(prev.ts) : ''}`,
       cls: dLast > 0 ? 'up' : dLast < 0 ? 'down' : ''
     })
   }
@@ -203,7 +233,7 @@ export const stats = computed(() => {
 
 /* ---------- 减肥进度 ---------- */
 export const progress = computed(() => {
-  const sorted = state.records.slice().sort((a, b) => (a.date < b.date ? -1 : 1))
+  const sorted = sortRecs(state.records)
   if (!sorted.length) return { empty: true, hasGoal: !!state.goal, goal: state.goal, cur: null, start: null, pct: 0, done: 0, need: 0, reached: false, direction: 'keep' }
   const start = sorted[0].weight
   const cur = sorted[sorted.length - 1].weight
@@ -365,16 +395,27 @@ export function pullAndMerge() {
 }
 
 /* ---------- 业务操作 ---------- */
-export function addOrUpdateRecord(date, weight, note) {
-  const idx = state.records.findIndex((r) => r.date === date)
-  if (idx >= 0) state.records[idx] = { date, weight, note }
-  else state.records.push({ date, weight, note })
+// 新增记录：总是追加，同一日期可有多条，按录入时间区分先后
+export function addRecord(date, weight, note) {
+  state.records.push({ id: genId(), date, weight, note, ts: Date.now() })
   saveLocal()
   pushRemote()
 }
 
-export function deleteRecord(date) {
-  state.records = state.records.filter((r) => r.date !== date)
+// 编辑单条记录：按 id 定位更新（date/weight/note 均可改）
+export function updateRecord(id, patch) {
+  const r = state.records.find((x) => x.id === id)
+  if (!r) return
+  if (patch && typeof patch.date === 'string' && DATE_RE.test(patch.date)) r.date = patch.date
+  if (patch && typeof patch.weight === 'number' && isFinite(patch.weight)) r.weight = patch.weight
+  if (patch && typeof patch.note === 'string') r.note = patch.note
+  saveLocal()
+  pushRemote()
+}
+
+// 删除单条记录（按 id），不再整日删除
+export function deleteRecord(id) {
+  state.records = state.records.filter((r) => r.id !== id)
   saveLocal()
   pushRemote()
 }

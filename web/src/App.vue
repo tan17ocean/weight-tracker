@@ -5,7 +5,7 @@ import {
   store, stats, progress, syncLabel,
   pushRemote, pullAndMerge,
   getUserId, switchUser,
-  addOrUpdateRecord, deleteRecord, saveSettings, importData, exportData, normalize
+  addRecord, updateRecord, deleteRecord, saveSettings, importData, exportData, normalize, sortRecs
 } from './store'
 import { getTheme, setTheme } from './theme'
 
@@ -38,27 +38,44 @@ function submit() {
   const weight = parseFloat(form.weight)
   if (!form.date) { alert('请选择日期'); return }
   if (!(weight >= 20 && weight <= 300)) { alert('请输入有效体重（20 - 300 kg）'); return }
-  const idx = store.records.findIndex((r) => r.date === form.date)
-  if (idx >= 0 && editing.value !== form.date) {
-    if (!confirm(`该日期已有记录（${store.records[idx].weight} kg），是否覆盖？`)) return
+  if (editing.value) {
+    // 编辑模式：只更新这一条记录
+    updateRecord(editing.value, { date: form.date, weight, note: form.note.trim() })
+  } else {
+    // 新增：总是追加一条，同一天可有多条，按录入时间区分
+    addRecord(form.date, weight, form.note.trim())
   }
-  addOrUpdateRecord(form.date, weight, form.note.trim())
   clearForm()
 }
 
-function startEdit(date) {
-  const r = store.records.find((x) => x.date === date)
+// 录入时间（时:分），用于区分同日多条记录
+function fmtTime(t) {
+  const d = new Date(t)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+const editingLabel = computed(() => {
+  if (!editing.value) return ''
+  const r = store.records.find((x) => x.id === editing.value)
+  if (!r) return ''
+  return `${r.date}${r.ts != null ? ' ' + fmtTime(r.ts) : ''}（${r.weight.toFixed(1)} kg）`
+})
+
+function startEdit(id) {
+  const r = store.records.find((x) => x.id === id)
   if (!r) return
-  editing.value = date
+  editing.value = id
   form.date = r.date
   form.weight = r.weight
   form.note = r.note || ''
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
-function delRecord(date) {
-  if (!confirm(`确定删除 ${date} 的记录吗？`)) return
-  deleteRecord(date)
+function delRecord(id) {
+  const r = store.records.find((x) => x.id === id)
+  if (!r) return
+  if (!confirm(`确定删除 ${r.date}${r.ts != null ? ' ' + fmtTime(r.ts) : ''} 的这条记录（${r.weight.toFixed(1)} kg）吗？`)) return
+  deleteRecord(id)
 }
 
 /* ---------- 设置 ---------- */
@@ -176,8 +193,8 @@ function onImport(ev) {
       const d = JSON.parse(rd.result)
       const nd = normalize({ records: d.records, goal: d.goal, height: d.height })
       if (!nd.records.length && !d.records) { alert('导入失败：文件中没有有效的记录数据'); return }
-      importData(nd.records, nd.goal, nd.height)
-      alert(`导入成功，共合并 ${nd.records.length} 条记录（同日期以新文件为准）`)
+importData(nd.records, nd.goal, nd.height)
+      alert(`导入成功，共合并 ${nd.records.length} 条记录（按条合并，同日多条均保留）`)
     } catch (e) { alert('导入失败：文件不是有效的 JSON 备份文件') }
   }
   rd.readAsText(f, 'utf-8')
@@ -195,15 +212,27 @@ function fmt(d) {
   const day = String(d.getDate()).padStart(2, '0')
   return `${d.getFullYear()}-${m}-${day}`
 }
-const sortedDesc = computed(() => store.records.slice().sort((a, b) => (a.date < b.date ? 1 : -1)))
+const sortedDesc = computed(() => sortRecs(store.records).reverse())
 
 /* ---------- 趋势图（SVG） ---------- */
 const W = 800, H = 300
 const M = { t: 20, r: 20, b: 32, l: 46 }
+const DAY_MS = 86400000
 const chart = computed(() => {
-  const sorted = store.records.slice().sort((a, b) => (a.date < b.date ? -1 : 1))
+  const sorted = sortRecs(store.records)
   if (!sorted.length) return { empty: true }
-  const ms = sorted.map((r) => new Date(r.date + 'T00:00:00').getTime())
+  // 同一日期多条记录：单条用真实录入时刻，多条按当天时间均匀展开，避免点重叠
+  const groups = new Map()
+  sorted.forEach((r) => { if (!groups.has(r.date)) groups.set(r.date, []); groups.get(r.date).push(r) })
+  const fracOf = (r) => (r.ts == null ? 0 : ((r.ts % DAY_MS) + DAY_MS) % DAY_MS)
+  const ms = sorted.map((r) => {
+    const dayStart = new Date(r.date + 'T00:00:00').getTime()
+    const g = groups.get(r.date)
+    if (g.length <= 1) return dayStart + fracOf(r)
+    const ordered = g.slice().sort((a, b) => fracOf(a) - fracOf(b))
+    const i = ordered.indexOf(r)
+    return dayStart + (DAY_MS / g.length) * (i + 0.5)
+  })
   const ws = sorted.map((r) => r.weight)
   let minW = Math.min(...ws), maxW = Math.max(...ws)
   if (minW === maxW) { minW -= 1; maxW += 1 }
@@ -250,8 +279,8 @@ function showTip(ev, p) {
   tip.show = true
   tip.left = left
   tip.top = p.y * scaleY - 12
-  tip.html =
-    `<b>${p.r.date}</b><br>${p.r.weight.toFixed(1)} kg` +
+tip.html =
+    `<b>${p.r.date}</b>${p.r.ts != null ? ` <span class="tip-ts">${fmtTime(p.r.ts)}</span>` : ''}<br>${p.r.weight.toFixed(1)} kg` +
     (p.r.note ? `<br><span class="tip-note">${esc(p.r.note)}</span>` : '')
 }
 function esc(s) {
@@ -317,8 +346,8 @@ onMounted(() => {
             <input type="text" id="inNote" v-model="form.note" maxlength="50" placeholder="可选，如：早晨空腹">
           </div>
           <button type="submit" class="btn primary" style="justify-content:center;">保存记录</button>
-          <div class="edit-hint" :hidden="editing === null">
-            正在编辑 {{ editing }} 的记录
+<div class="edit-hint" :hidden="editing === null">
+            正在编辑 {{ editingLabel }}
             <button type="button" class="link" @click="clearForm">取消</button>
           </div>
         </form>
@@ -478,8 +507,8 @@ onMounted(() => {
           </g>
           <path :d="chart.areaD" fill="url(#areaGrad)" stroke="none"/>
           <path class="trend-line" :d="chart.lineD"/>
-          <circle
-            v-for="p in chart.pts" :key="p.r.date"
+<circle
+            v-for="p in chart.pts" :key="p.r.id"
             class="trend-dot"
             :cx="p.x" :cy="p.y" r="4.5"
             @mouseenter="showTip($event, p)"
@@ -495,16 +524,17 @@ onMounted(() => {
     <div class="card">
       <h3 class="card-title"><i>☰</i>历史记录 <span class="hint">共 {{ sortedDesc.length }} 条</span></h3>
       <ul class="list" v-if="sortedDesc.length">
-        <li class="row" v-for="r in sortedDesc" :key="r.date">
+<li class="row" v-for="r in sortedDesc" :key="r.id">
           <div class="row-main">
             <span class="date">{{ r.date }}</span>
+            <span class="time" v-if="r.ts != null">{{ fmtTime(r.ts) }}</span>
             <span class="rel" v-if="relLabel(r.date)">{{ relLabel(r.date) }}</span>
             <span class="weight">{{ r.weight.toFixed(1) }} kg</span>
             <span class="note" v-if="r.note" :title="r.note">{{ r.note }}</span>
           </div>
           <div class="row-ops">
-            <button class="link" @click="startEdit(r.date)">编辑</button>
-            <button class="link danger" @click="delRecord(r.date)">删除</button>
+            <button class="link" @click="startEdit(r.id)">编辑</button>
+            <button class="link danger" @click="delRecord(r.id)">删除</button>
           </div>
         </li>
       </ul>
