@@ -4,7 +4,7 @@ import './styles/main.css'
 import {
   store, stats, progress, syncLabel,
   pushRemote, pullAndMerge,
-  getUserId, switchUser,
+  getUserId, switchUser, uidPersisted,
   addRecord, updateRecord, deleteRecord, saveSettings, importData, exportData, normalize, sortRecs
 } from './store'
 import { getTheme, setTheme } from './theme'
@@ -156,6 +156,9 @@ function saveUid() {
     alert('昵称已清除，数据将只保存在本机。重新设置昵称即可恢复云端同步')
   } else {
     uid.value = safe
+    if (!uidPersisted()) {
+      alert('提示：当前浏览器限制了本地存储（常见于无痕模式或内置浏览器）。昵称本次已生效，但可能无法在下次打开时保留；建议改用系统浏览器并退出无痕模式，否则云端数据无法自动恢复')
+    }
     pullAndMerge()
   }
 }

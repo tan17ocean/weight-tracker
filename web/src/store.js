@@ -103,16 +103,46 @@ function fmtTime(t) {
 
 const todayStr = () => fmtDate(new Date())
 
+/* ---------- 存储工具（localStorage 优先，Cookie 兜底身份键） ---------- */
+// 部分移动端环境（无痕模式 / App 内置 WebView）localStorage 写入会被静默拒绝，
+// 导致昵称"看似设置成功、下次打开丢失"。身份键（UID）双写 localStorage + Cookie：
+// 任一介质成功即可在下次打开时恢复身份，随后从云端拉回数据；全部失败时向 UI 暴露信号。
+const UID_COOKIE = 'wt_uid'
+let lastPersisted = true // 最近一次 setUserId 是否至少有一个介质写入成功
+
+function lsGet(k) { try { return localStorage.getItem(k) } catch (e) { return null } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); return localStorage.getItem(k) === v } catch (e) { return false } }
+function lsDel(k) { try { localStorage.removeItem(k) } catch (e) { /* ignore */ } }
+function cookieGet(k) {
+  const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + k + '=([^;]*)'))
+  return m ? decodeURIComponent(m[1]) : ''
+}
+function cookieSet(k, v) {
+  try {
+    document.cookie = `${k}=${encodeURIComponent(v)}; max-age=31536000; path=/; SameSite=Lax`
+    return cookieGet(k) === v
+  } catch (e) { return false }
+}
+function cookieDel(k) { try { document.cookie = `${k}=; max-age=0; path=/` } catch (e) { /* ignore */ } }
+
+// 最近一次昵称写入是否至少有一个介质成功持久化（供 UI 提示用户）
+export function uidPersisted() { return lastPersisted }
+
 /* ---------- 用户身份 ---------- */
 export function getUserId() {
-  try { return localStorage.getItem(UID_KEY) || '' } catch (e) { return '' }
+  return lsGet(UID_KEY) || cookieGet(UID_COOKIE) || ''
 }
 export function setUserId(uid) {
   const safe = String(uid || '').trim().slice(0, 40).replace(/[\\/:*?"<>|#%{}\s]/g, '')
-  try {
-    if (safe) localStorage.setItem(UID_KEY, safe)
-    else localStorage.removeItem(UID_KEY)
-  } catch (e) { /* ignore */ }
+  if (safe) {
+    const okL = lsSet(UID_KEY, safe)
+    const okC = cookieSet(UID_COOKIE, safe)
+    lastPersisted = okL || okC
+  } else {
+    lsDel(UID_KEY)
+    cookieDel(UID_COOKIE)
+    lastPersisted = true
+  }
   return safe
 }
 // 切换当前用户：写入身份 → 重载该用户的本地数据
