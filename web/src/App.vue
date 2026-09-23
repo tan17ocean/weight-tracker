@@ -248,11 +248,49 @@ function filterByRange(sorted) {
   const cutStr = fmt(cut)
   return sorted.filter((r) => r.date >= cutStr)
 }
+/* ---------- 趋势预测带 ---------- */
+// 对当前范围的记录按日期聚合日均值 → 最小二乘线性回归 → 外推未来 14 天预测
+// 带宽由残差标准差 σ 驱动并随时间（√天数）扩宽，形成"越远越不确定"的漏斗感
+const PRED_DAYS = 14
+function computePred(sorted) {
+  const byDay = new Map()
+  sorted.forEach((r) => {
+    if (!byDay.has(r.date)) byDay.set(r.date, [])
+    byDay.get(r.date).push(r.weight)
+  })
+  const days = [...byDay.entries()]
+    .map(([date, ws]) => ({ t: new Date(date + 'T00:00:00').getTime(), w: ws.reduce((a, b) => a + b, 0) / ws.length }))
+    .sort((a, b) => a.t - b.t)
+  if (days.length < 3) return null
+  const t0 = days[0].t
+  const xs = days.map((d) => (d.t - t0) / DAY_MS)
+  const ys = days.map((d) => d.w)
+  const n = ys.length
+  let sx = 0, sy = 0, sxy = 0, sxx = 0
+  for (let i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; sxy += xs[i] * ys[i]; sxx += xs[i] * xs[i] }
+  const denom = n * sxx - sx * sx
+  if (!denom || Math.abs(denom) < 1e-9) return null
+  const slope = (n * sxy - sx * sy) / denom // kg/天
+  const inter = (sy - slope * sx) / n
+  let ss = 0
+  for (let i = 0; i < n; i++) { const e = ys[i] - (inter + slope * xs[i]); ss += e * e }
+  const sigma = Math.sqrt(ss / n)
+  const last = days[days.length - 1]
+  return { slope, sigma, lastT: last.t, lastW: last.w }
+}
+// 阶梯路径：每个点先水平到下一个点 x，再垂直落到该点 y（像素风）
+function stepPath(px) {
+  if (!px.length) return ''
+  let d = `M${px[0].x.toFixed(1)},${px[0].y.toFixed(1)}`
+  for (let i = 1; i < px.length; i++) d += ` H${px[i].x.toFixed(1)} V${px[i].y.toFixed(1)}`
+  return d
+}
 const chart = computed(() => {
   const all = sortRecs(store.records)
   if (!all.length) return { empty: true }
   const sorted = filterByRange(all)
   if (!sorted.length) return { empty: true }
+  const pred = computePred(sorted)
   // 同一日期多条记录：单条用真实录入时刻，多条按当天时间均匀展开，避免点重叠
   const groups = new Map()
   sorted.forEach((r) => { if (!groups.has(r.date)) groups.set(r.date, []); groups.get(r.date).push(r) })
@@ -267,10 +305,20 @@ const chart = computed(() => {
   })
   const ws = sorted.map((r) => r.weight)
   let minW = Math.min(...ws), maxW = Math.max(...ws)
+  // 预测带纳入 Y 轴范围，防止外推曲线/带宽溢出
+  if (pred) {
+    const maxDev = 1.2 * pred.sigma * Math.sqrt(PRED_DAYS)
+    const hi = pred.lastW + pred.slope * PRED_DAYS + maxDev
+    const lo = pred.lastW + pred.slope * PRED_DAYS - maxDev
+    if (hi > maxW) maxW = hi
+    if (lo < minW) minW = lo
+  }
   if (minW === maxW) { minW -= 1; maxW += 1 }
   const pad = (maxW - minW) * 0.12; minW -= pad; maxW += pad
   const pw = W - M.l - M.r, ph = H - M.t - M.b
-  const X = (t) => M.l + ((ms[0] === ms[ms.length - 1]) ? pw / 2 : (t - ms[0]) / (ms[ms.length - 1] - ms[0]) * pw)
+  // X 轴右端延伸出预测区，让预测带可视地"走出"数据区
+  const xEnd = pred ? ms[ms.length - 1] + PRED_DAYS * DAY_MS : ms[ms.length - 1]
+  const X = (t) => M.l + ((ms[0] === xEnd) ? pw / 2 : (t - ms[0]) / (xEnd - ms[0]) * pw)
   const Y = (w) => M.t + ph - (w - minW) / (maxW - minW) * ph
 
   const gridLines = []
@@ -290,7 +338,7 @@ const chart = computed(() => {
   const goalLine = store.goal !== null ? { y: Y(store.goal), label: `目标 ${dispKg(store.goal).toFixed(1)} ${unitLabel.value}`, inRange: Y(store.goal) >= M.t - 8 && Y(store.goal) <= H - M.b + 8 } : null
 
   const pts = sorted.map((r, j) => ({ x: X(ms[j]), y: Y(r.weight), r }))
-  const lineD = 'M' + pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L')
+  const lineD = stepPath(pts)
   const areaD = `${lineD} L${pts[pts.length - 1].x.toFixed(1)},${H - M.b} L${pts[0].x.toFixed(1)},${H - M.b} Z`
 
   // 7 天移动平均：按日期聚合取均值 → 以每个日期为窗口终点，向前取至多 7 天有记录的日均值求平均
@@ -309,14 +357,34 @@ const chart = computed(() => {
         for (let k = from; k <= i; k++) s += days[k].w
         return { x: X(d.t), y: Y(s / (i - from + 1)) }
       })
-      maD = 'M' + ma.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L')
+      maD = stepPath(ma)
     }
   }
 
+  // 预测带几何：中位虚线 + 漏斗形阴影带（越远越宽）
+  let predD = '', predMidD = '', predFlag = ''
+  if (pred) {
+    const band = []
+    for (let k = 0; k <= PRED_DAYS; k += 2) {
+      const t = pred.lastT + k * DAY_MS
+      const mid = pred.lastW + pred.slope * k
+      const dev = 1.2 * pred.sigma * Math.sqrt(Math.max(1, k))
+      band.push({ x: X(t), yUp: Y(mid + dev), yMid: Y(mid), yLo: Y(mid - dev) })
+    }
+    const up = band.map((p) => `${p.x.toFixed(1)},${p.yUp.toFixed(1)}`).join(' L')
+    const lo = band.map((p) => `${p.x.toFixed(1)},${p.yLo.toFixed(1)}`).reverse().join(' L')
+    predD = `M${up} L${lo} Z`
+    predMidD = 'M' + band.map((p) => `${p.x.toFixed(1)},${p.yMid.toFixed(1)}`).join(' L')
+    predFlag = `${PRED_DAYS} 天预测`
+  }
+
   const rangeLabel = chartRange.value === '90' ? '近 90 天' : chartRange.value === '30' ? '近 30 天' : '全部'
+  const metaBits = [`共 ${sorted.length} 条（${rangeLabel}）`, `${sorted[0].date} 至 ${sorted[sorted.length - 1].date}`]
+  if (groups.size >= 2) metaBits.push('虚线 7 天均值')
+  if (pred) metaBits.push('右侧为未来 14 天预测')
   return {
-    empty: false, pts, lineD, areaD, maD, gridLines, xLabels, goalLine,
-    meta: `共 ${sorted.length} 条（${rangeLabel}）· ${sorted[0].date} 至 ${sorted[sorted.length - 1].date}${groups.size >= 2 ? ' · 虚线为 7 天均值' : ''}`
+    empty: false, pts, lineD, areaD, maD, predD, predMidD, predFlag,
+    gridLines, xLabels, goalLine, meta: metaBits.join(' · ')
   }
 })
 
@@ -575,34 +643,44 @@ onMounted(() => {
         <span class="hint">{{ chart.meta }}</span>
       </div>
       <div class="chart-wrap" ref="chartWrap" @mouseleave="onWrapLeave">
-        <svg viewBox="0 0 800 300" role="img" aria-label="体重趋势折线图">
+        <svg viewBox="0 0 800 300" role="img" aria-label="体重趋势折线图（像素复古风，含未来14天预测）">
           <defs>
             <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="var(--primary)" stop-opacity="0.16"/>
-              <stop offset="100%" stop-color="var(--primary)" stop-opacity="0"/>
+              <stop offset="0%" stop-color="#01cdfe" stop-opacity="0.22"/>
+              <stop offset="100%" stop-color="#01cdfe" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#140a2e"/>
+              <stop offset="100%" stop-color="#0b0520"/>
             </linearGradient>
           </defs>
-          <g class="grid-line" v-for="g in chart.gridLines" :key="g.y">
+          <rect x="0" y="0" width="800" height="300" rx="14" fill="url(#bgGrad)"/>
+          <g class="grid-line pixel" v-for="g in chart.gridLines" :key="g.y">
             <line :x1="M.l" :y1="g.y" :x2="W - M.r" :y2="g.y"/>
-            <text :x="M.l - 8" :y="g.y + 4" text-anchor="end" font-size="11" fill="var(--text-muted)">{{ g.label }}</text>
+            <text :x="M.l - 8" :y="g.y + 4" text-anchor="end" font-size="11" fill="#9d8bff">{{ g.label }}</text>
           </g>
           <g class="x-label" v-for="xl in chart.xLabels" :key="xl.x">
-            <text :x="xl.x" :y="H - M.b + 18" text-anchor="middle" font-size="11" fill="var(--text-muted)">{{ xl.text }}</text>
+            <text :x="xl.x" :y="H - M.b + 18" text-anchor="middle" font-size="11" fill="#9d8bff">{{ xl.text }}</text>
           </g>
           <g v-if="chart.goalLine && chart.goalLine.inRange">
             <line class="goal-line" :x1="M.l" :y1="chart.goalLine.y" :x2="W - M.r" :y2="chart.goalLine.y"/>
-            <text :x="W - M.r - 2" :y="chart.goalLine.y - 6" text-anchor="end" font-size="11" fill="var(--red)">{{ chart.goalLine.label }}</text>
+            <text :x="W - M.r - 2" :y="chart.goalLine.y - 6" text-anchor="end" font-size="11" fill="#ffe45e">{{ chart.goalLine.label }}</text>
           </g>
           <path :d="chart.areaD" fill="url(#areaGrad)" stroke="none"/>
+          <path :d="chart.predD" class="pred-band" v-if="chart.predD"/>
+          <path :d="chart.predMidD" class="pred-mid" v-if="chart.predMidD"/>
           <path :d="chart.maD" class="trend-ma" v-if="chart.maD"/>
           <path class="trend-line" :d="chart.lineD"/>
-<circle
+          <rect
             v-for="p in chart.pts" :key="p.r.id"
-            class="trend-dot"
-            :cx="p.x" :cy="p.y" r="4.5"
+            class="trend-dot" :x="p.x - 4" :y="p.y - 4" width="8" height="8"
             @mouseenter="showTip($event, p)"
             @click="toggleTip($event, p)"
           />
+          <g v-if="chart.predFlag">
+            <rect :x="W - M.r - 88" :y="H - M.b - 24" width="88" height="20" rx="4" fill="#ff71ce"/>
+            <text :x="W - M.r - 44" :y="H - M.b - 10" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a0033">{{ chart.predFlag }}</text>
+          </g>
         </svg>
         <div class="tip" :hidden="!tip.show" :style="{ left: tip.left + 'px', top: tip.top + 'px' }" v-html="tip.html"></div>
       </div>
@@ -654,12 +732,25 @@ onMounted(() => {
 
 <style scoped>
 .form { display: flex; flex-direction: column; gap: 12px; }
-.grid-line line { stroke: var(--border); stroke-width: 1; }
-.goal-line { stroke: var(--red); stroke-dasharray: 6 4; stroke-width: 1.5; opacity: .75; }
-.trend-line { fill: none; stroke: var(--primary); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
-.trend-ma { fill: none; stroke: var(--primary-2, #f2a33c); stroke-width: 1.8; stroke-dasharray: 5 4; opacity: .8; stroke-linejoin: round; stroke-linecap: round; }
-.trend-dot { fill: var(--bg-card); stroke: var(--primary); stroke-width: 2; cursor: pointer; transition: r .15s ease; }
-.trend-dot:hover { r: 6; }
+/* ---- 像素复古风趋势图 ---- */
+.chart-wrap { position: relative; }
+/* CRT 扫描线 */
+.chart-wrap::after {
+  content: '';
+  position: absolute; inset: 0;
+  pointer-events: none;
+  border-radius: 14px;
+  background: repeating-linear-gradient(to bottom, rgba(255,255,255,.028) 0 1px, transparent 1px 3px);
+  mix-blend-mode: screen;
+}
+.grid-line.pixel line { stroke: rgba(157,139,255,.18); stroke-width: 1; stroke-dasharray: 2 6; }
+.goal-line { stroke: #ffe45e; stroke-dasharray: 6 4; stroke-width: 1.5; opacity: .8; }
+.trend-line { fill: none; stroke: #01cdfe; stroke-width: 2.5; stroke-linejoin: miter; filter: drop-shadow(0 0 3px rgba(1,205,254,.55)); }
+.trend-ma { fill: none; stroke: #ff71ce; stroke-width: 1.8; stroke-dasharray: 6 5; opacity: .9; filter: drop-shadow(0 0 2px rgba(255,113,206,.5)); }
+.pred-band { fill: rgba(255,113,206,.10); stroke: rgba(255,113,206,.35); stroke-width: 1; stroke-dasharray: 3 4; }
+.pred-mid { fill: none; stroke: #ff71ce; stroke-width: 1.6; stroke-dasharray: 2 6; stroke-linecap: round; opacity: .95; }
+.trend-dot { fill: #0b0520; stroke: #01cdfe; stroke-width: 2; cursor: pointer; transform-box: fill-box; transform-origin: center; transition: transform .12s, fill .12s; }
+.trend-dot:hover { transform: scale(1.35); fill: #01cdfe; }
 .chart-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .chart-ranges { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .range-btn { border: none; background: transparent; color: var(--text-muted); font-size: 12px; padding: 3px 11px; cursor: pointer; transition: background .15s, color .15s; }
