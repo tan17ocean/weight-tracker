@@ -7,6 +7,7 @@ import { reactive, computed } from 'vue'
 const LS_KEY = 'weight-log-data-v1'
 const UID_KEY = 'wt_user_id'
 const FIRST_USER_KEY = 'wt_first_user' // 本机第一个设置昵称的用户：唯一允许继承旧数据的用户
+const DIRTY_KEY = 'wt_dirty' // 本地有改动未成功推送到云端时为 '1'（断网/失败期间置位，恢复后自动补推）
 
 // 站点密钥：必须与 Worker 环境变量 SITE_KEY 完全一致（部署 Worker 时填入）
 const SITE_KEY = 'wtsk-891daa4c581a01097189e6a1'
@@ -128,6 +129,18 @@ function cookieDel(k) { try { document.cookie = `${k}=; max-age=0; path=/` } cat
 // 最近一次昵称写入是否至少有一个介质成功持久化（供 UI 提示用户）
 export function uidPersisted() { return lastPersisted }
 
+/* ---------- 云端基准版本与脏标记（并发写保护 + 断网补推） ---------- */
+let baseSha = '' // 最近一次成功读取/写入的远端文件版本 sha，作为乐观并发写入基准
+export function setBaseSha(sha) { baseSha = sha || '' }
+export function getBaseSha() { return baseSha }
+// 脏标记：本地有改动但尚未成功推送到云端时为 '1'；网络恢复/回到前台时自动重推
+function isDirty() {
+  try { return localStorage.getItem(DIRTY_KEY) === '1' } catch (e) { return false }
+}
+function setDirty(v) {
+  try { v ? localStorage.setItem(DIRTY_KEY, '1') : localStorage.removeItem(DIRTY_KEY) } catch (e) { /* ignore */ }
+}
+
 /* ---------- 用户身份 ---------- */
 export function getUserId() {
   return lsGet(UID_KEY) || cookieGet(UID_COOKIE) || ''
@@ -156,6 +169,7 @@ export function switchUser(uid) {
     try { localStorage.setItem(FIRST_USER_KEY, safe) } catch (e) { /* ignore */ }
   }
   const data = loadLocal(!prev && !!safe)
+  baseSha = '' // 切换用户后旧基准失效，下次 push 会自动拉远端合并后再写，不覆盖他人数据
   state.records = data.records
   state.goal = data.goal
   state.height = data.height
@@ -297,7 +311,7 @@ export const syncLabel = computed(() => {
   switch (state.syncState) {
     case 'ok': return '已同步'
     case 'syncing': return '同步中…'
-    case 'error': return '同步失败'
+    case 'error': return isDirty() ? '本地已存待重推' : '同步失败'
     case 'local': return '本地模式'
     default: return '同步'
   }
@@ -316,7 +330,8 @@ function fetchRemote() {
     .then((j) => {
       // Worker 约定：文件不存在时返回 { exists:false, records:[], goal:null, height:null }
       if (!j || !j.exists) return null
-      return { records: j.records || [], goal: j.goal ?? null, height: j.height ?? null }
+      // sha 为该文件当前版本（乐观并发基准），供并发写保护使用
+      return { records: j.records || [], goal: j.goal ?? null, height: j.height ?? null, sha: j.sha || '' }
     })
 }
 
@@ -340,36 +355,61 @@ export function pushRemote() {
     return Promise.resolve(false)
   }
   setSyncState('syncing', '正在同步…')
-  // 先探测远端文件是否存在：不存在且是本机首个用户时，合并旧版公开 data.json，保证历史数据迁移不丢
+  // 先探测远端文件：不存在且是本机首个用户时，合并旧版公开 data.json 保证历史迁移不丢；
+  // 已存在且本地基准缺失/过期时先合并远端再写，避免覆盖其他设备的写入（并发写保护）
   return fetch(userApi(uid), { headers: proxyHeaders(), cache: 'no-store' })
     .then((res) => {
       if (!res.ok) return res.json().catch(() => null).then((er) => { throw new Error(why(res, er)) })
       return res.json()
     })
     .then((j) => {
-      const payload = { records: state.records, goal: state.goal, height: state.height }
-      if ((!j || !j.exists) && uid === firstUser()) {
-        return fetch(CFG.legacyRaw, { cache: 'no-store' })
-          .then((res) => (res.ok ? res.json() : null))
-          .catch(() => null)
-          .then((legacy) => (legacy ? mergeData(payload, normalize(legacy)) : payload))
+      let payload = { records: state.records, goal: state.goal, height: state.height }
+      if (!j || !j.exists) {
+        if (uid === firstUser()) {
+          return fetch(CFG.legacyRaw, { cache: 'no-store' })
+            .then((res) => (res.ok ? res.json() : null))
+            .catch(() => null)
+            .then((legacy) => (legacy ? mergeData(payload, normalize(legacy)) : payload))
+        }
+        return payload
+      }
+      if (j.sha && (!baseSha || baseSha !== j.sha)) {
+        // 基准版本缺失或过期：把远端数据合并进本次写入，任何一端的数据都不丢
+        payload = mergeData(payload, normalize(j))
+        baseSha = j.sha
       }
       return payload
     })
     .then((payload) => {
       let attempt = 0
-      const doPut = () => fetch(userApi(uid), {
-        method: 'PUT',
-        headers: { ...proxyHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      }).then((res) => {
-        if (res.status >= 500 && attempt < 3) {
-          attempt++
-          setSyncState('syncing', `服务器繁忙（HTTP ${res.status}），第 ${attempt}/3 次重试…`)
-          return new Promise((r) => setTimeout(r, 1500 * attempt)).then(doPut)
-        }
-        return res
-      })
+      let conflicted = false // 409 只合并重试一次，避免死循环
+      const doPut = () => {
+        const headers = { ...proxyHeaders(), 'Content-Type': 'application/json' }
+        if (baseSha) headers['X-Base-Sha'] = baseSha
+        return fetch(userApi(uid), { method: 'PUT', headers, body: JSON.stringify(payload) })
+          .then((res) => {
+            if (res.status === 409 && !conflicted) {
+              // 即将写入瞬间远端又被其他设备改动：拉最新 → 合并 → 换新基准重推一次
+              conflicted = true
+              setSyncState('syncing', '检测到其他设备已更新，合并后重推…')
+              return fetch(userApi(uid), { headers: proxyHeaders(), cache: 'no-store' })
+                .then((r2) => (r2.ok ? r2.json() : null))
+                .then((latest) => {
+                  if (latest && latest.exists && latest.sha) {
+                    payload = mergeData(payload, normalize(latest))
+                    baseSha = latest.sha
+                  }
+                  return doPut()
+                })
+            }
+            if (res.status >= 500 && attempt < 3) {
+              attempt++
+              setSyncState('syncing', `服务器繁忙（HTTP ${res.status}），第 ${attempt}/3 次重试…`)
+              return new Promise((r) => setTimeout(r, 1500 * attempt)).then(doPut)
+            }
+            return res
+          })
+      }
       return doPut()
     })
     .then((res) => {
@@ -378,12 +418,16 @@ export function pushRemote() {
       }
       return res.json()
     })
-    .then(() => {
+    .then((j) => {
+      if (j && j.sha) baseSha = j.sha // 以刚写入的远端版本作为新基准
+      setDirty(false)
       setSyncState('ok', `已同步上线 · ${todayStr()}`)
       return true
     })
     .catch((e) => {
-      setSyncState('error', `同步失败：${e.message}`)
+      // 未成功同步：数据已保存本地，置脏标记；联网/回到前台自动重推，不丢数据
+      setDirty(true)
+      setSyncState('error', `本地已保存，联网后自动重推（${e.message}）`)
       return false
     })
 }
@@ -405,6 +449,7 @@ export function pullAndMerge() {
         if (dirty) pushRemote()
         return
       }
+      setBaseSha(remote.sha) // 记录远端版本，供本次后续写入作为并发基准
       const rn = normalize(remote)
       const merged = mergeData({ records: state.records, goal: state.goal, height: state.height }, rn)
       const changed = !dataEq(merged, { records: state.records, goal: state.goal, height: state.height })
@@ -416,6 +461,7 @@ export function pullAndMerge() {
       if (changed || localExtra || ((state.goal || state.height) && !rn.goal && !rn.height)) {
         pushRemote()
       } else {
+        setDirty(false) // 本地与线上一致，无残留改动
         setSyncState('ok', `已从线上载入 ${rn.records.length} 条记录`)
       }
     })
@@ -477,4 +523,19 @@ export function exportData() {
   a.download = `weight-records-${todayStr()}.json`
   a.click()
   URL.revokeObjectURL(a.href)
+}
+
+/* ---------- 断网恢复自动补推 ---------- */
+// 同步失败时数据已保存在本地（脏标记置位）；网络恢复或页面回到前台时自动重推，
+// 避免断网期间的改动一直滞留本机；推成功或本地无改动时自动清除脏标记。
+function autoPush() {
+  if (isDirty() && getUserId() && proxyReady() && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+    pushRemote()
+  }
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', autoPush)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') autoPush()
+  })
 }
