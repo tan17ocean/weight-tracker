@@ -5,7 +5,8 @@ import {
   store, stats, progress, syncLabel, unitLabel, dispKg,
   pushRemote, pullAndMerge,
   getUserId, switchUser, uidPersisted,
-  addRecord, updateRecord, deleteRecord, saveSettings, exportData, sortRecs
+  addRecord, updateRecord, deleteRecord, saveSettings, exportData, sortRecs,
+  validateWeight, WEIGHT_MIN, WEIGHT_MAX
 } from './store'
 import { getTheme, setTheme } from './theme'
 
@@ -26,12 +27,16 @@ const today = () => {
 }
 const form = reactive({ date: today(), weight: '', note: '' })
 const editing = ref(null)
+const wErr = ref('')       // 体重行内校验提示
+const forceSave = ref(false) // 用户点击「仍要保存」后置真，跳过校验
 
 function clearForm() {
   editing.value = null
   form.date = today()
   form.weight = ''
   form.note = ''
+  wErr.value = ''
+  forceSave.value = false
 }
 
 /* ---------- 保存反馈（toast + 行高亮） ---------- */
@@ -51,9 +56,16 @@ function flashRow(id) {
 }
 
 function submit() {
+  if (!form.date) { showToast('请选择日期', 'error'); return }
+  const check = validateWeight(form.weight)
+  if (!check.ok && !forceSave.value) {
+    wErr.value = check.msg
+    showToast(check.msg, 'error')
+    return
+  }
+  wErr.value = ''
+  forceSave.value = false
   const weight = parseFloat(form.weight)
-  if (!form.date) { alert('请选择日期'); return }
-  if (!(weight >= 20 && weight <= 300)) { alert('请输入有效体重（20 - 300 kg）'); return }
   const isEdit = editing.value !== null
   const editedId = editing.value
   if (isEdit) {
@@ -112,10 +124,13 @@ watch(
 function saveGoalHeight() {
   const g = parseFloat(settings.goal)
   const h = parseFloat(settings.height)
-  if (settings.goal !== '' && !(g >= 20 && g <= 300)) { alert('目标体重无效（20 - 300 kg）'); return }
+  if (settings.goal !== '') {
+    const chk = validateWeight(settings.goal)
+    if (!chk.ok) { showToast(chk.msg, 'error'); return }
+  }
   if (settings.height !== '' && !(h >= 80 && h <= 250)) { alert('身高无效（80 - 250 cm）'); return }
   saveSettings(settings.goal === '' ? null : g, settings.height === '' ? null : h)
-  alert('设置已保存')
+  showToast('设置已保存')
 }
 
 // 单位切换：仅展示换算，存储始终 kg
@@ -165,7 +180,8 @@ function saveGoal() {
     goalInput.value = ''
     saveSettings(null, store.height)
   } else {
-    if (!(g >= 20 && g <= 300)) { alert('目标体重无效（20 - 300 kg）'); return }
+    const chk = validateWeight(goalInput.value)
+    if (!chk.ok) { showToast(chk.msg, 'error'); return }
     saveSettings(g, store.height)
   }
   editingGoal.value = false
@@ -473,14 +489,18 @@ onMounted(() => {
       <!-- 左栏：表单 + 设置 -->
       <div class="card">
         <h3 class="card-title"><i>＋</i>添加记录</h3>
-        <form class="form" @submit.prevent="submit" autocomplete="off">
+<form class="form" @submit.prevent="submit" autocomplete="off" novalidate>
           <div class="field">
             <label for="inDate">日期</label>
-            <input type="date" id="inDate" v-model="form.date" required>
+            <input type="date" id="inDate" v-model="form.date">
           </div>
-          <div class="field">
-            <label for="inWeight">体重（kg）</label>
-            <input type="number" id="inWeight" v-model="form.weight" min="20" max="300" step="0.1" required placeholder="如 72.5">
+          <div class="field" :class="{ 'field-invalid': wErr }">
+            <label for="inWeight">体重（kg，{{ WEIGHT_MIN }}-{{ WEIGHT_MAX }}）</label>
+            <input type="number" id="inWeight" v-model="form.weight" :min="WEIGHT_MIN" :max="WEIGHT_MAX" step="0.1" placeholder="如 72.5" @input="wErr = ''">
+            <p class="field-err" v-if="wErr">
+              {{ wErr }}
+              <button type="button" class="link danger" @click="forceSave = true; submit()">仍要保存</button>
+            </p>
           </div>
           <div class="field">
             <label for="inNote">备注</label>
@@ -498,7 +518,7 @@ onMounted(() => {
           <div class="setting-body">
             <div class="field">
               <label for="inGoal">目标体重（kg）</label>
-              <input type="number" id="inGoal" v-model="settings.goal" min="20" max="300" step="0.1" placeholder="可选">
+              <input type="number" id="inGoal" v-model="settings.goal" :min="WEIGHT_MIN" :max="WEIGHT_MAX" step="0.1" placeholder="可选">
             </div>
             <div class="field">
               <label for="inHeight">身高（cm）</label>
@@ -561,7 +581,7 @@ onMounted(() => {
             <button class="btn small" @click="startGoalEdit">修改</button>
           </template>
           <template v-else>
-            <input type="number" id="inGoalInline" v-model="goalInput" min="20" max="300" step="0.1" placeholder="目标体重 kg" @keyup.enter="saveGoal">
+            <input type="number" id="inGoalInline" v-model="goalInput" :min="WEIGHT_MIN" :max="WEIGHT_MAX" step="0.1" placeholder="目标体重 kg" @keyup.enter="saveGoal">
             <button class="btn small primary" @click="saveGoal">保存</button>
             <button class="btn small" @click="editingGoal = false">取消</button>
           </template>
@@ -575,7 +595,7 @@ onMounted(() => {
           目标体重未设置。设置后即可查看减肥进度。当前体重 <b>{{ dispKg(progress.cur).toFixed(1) }}</b> {{ unitLabel }}。
         </template>
         <div v-if="editingGoal && !hasGoalSet" class="prog-inline">
-          <input type="number" id="inGoalInline" v-model="goalInput" min="20" max="300" step="0.1" placeholder="目标体重（kg）" @keyup.enter="saveGoal">
+          <input type="number" id="inGoalInline" v-model="goalInput" :min="WEIGHT_MIN" :max="WEIGHT_MAX" step="0.1" placeholder="目标体重（kg）" @keyup.enter="saveGoal">
           <button class="btn small primary" @click="saveGoal">保存目标</button>
           <button class="btn small" @click="editingGoal = false">取消</button>
         </div>
@@ -761,6 +781,14 @@ onMounted(() => {
 .unit-opt input { accent-color: var(--primary); }
 .prog-stat-hint { display: block; font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 .prog-stat-num.eta { color: var(--primary); }
+
+/* 体重校验：输入框错误态 + 行内提示 + 「仍要保存」 */
+.field-invalid input { border-color: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+.field-err {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 12px; color: var(--red); margin-top: 2px;
+}
+.field-err .link.danger { flex-shrink: 0; }
 
 /* 编辑保存后对应历史记录行短暂高亮淡出 */
 .row.flash { animation: rowFlash 1.7s ease; }

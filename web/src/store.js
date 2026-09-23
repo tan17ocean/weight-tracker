@@ -524,6 +524,22 @@ export function pullAndMerge() {
 }
 
 /* ---------- 业务操作 ---------- */
+// 体重合法区间（kg，含边界）；录入校验统一走这里，返回 { ok, msg }
+export const WEIGHT_MIN = 20
+export const WEIGHT_MAX = 400
+export function validateWeight(w) {
+  if (w === '' || w === null || w === undefined) return { ok: false, msg: '请输入体重（kg）' }
+  const s = String(w).trim()
+  if (s === '') return { ok: false, msg: '请输入体重（kg）' }
+  // 拒绝非数字 / 科学计数法 / 表达式等会被 parseFloat 放行的写法（如 "1e3"、"abc"、"1+1"、"0x2a"）
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return { ok: false, msg: '体重格式不正确，请输入数字' }
+  const n = Number(s)
+  if (!Number.isFinite(n)) return { ok: false, msg: '体重格式不正确，请输入数字' }
+  if (n < WEIGHT_MIN || n > WEIGHT_MAX) {
+    return { ok: false, msg: `体重需在 ${WEIGHT_MIN}-${WEIGHT_MAX} kg 之间` }
+  }
+  return { ok: true, msg: '' }
+}
 // 新增记录：总是追加，同一日期可有多条，按录入时间区分先后
 export function addRecord(date, weight, note) {
   state.records.push({ id: genId(), date, weight, note, ts: Date.now() })
