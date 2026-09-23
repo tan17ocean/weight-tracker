@@ -34,18 +34,38 @@ function clearForm() {
   form.note = ''
 }
 
+/* ---------- 保存反馈（toast + 行高亮） ---------- */
+const toast = ref(null)
+let toastTimer = null
+function showToast(text, kind = 'ok') {
+  toast.value = { text, kind }
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toast.value = null }, 2200)
+}
+const hlId = ref(null)
+let hlTimer = null
+function flashRow(id) {
+  hlId.value = id
+  clearTimeout(hlTimer)
+  hlTimer = setTimeout(() => { hlId.value = null }, 1800)
+}
+
 function submit() {
   const weight = parseFloat(form.weight)
   if (!form.date) { alert('请选择日期'); return }
   if (!(weight >= 20 && weight <= 300)) { alert('请输入有效体重（20 - 300 kg）'); return }
-  if (editing.value) {
+  const isEdit = editing.value !== null
+  const editedId = editing.value
+  if (isEdit) {
     // 编辑模式：只更新这一条记录
-    updateRecord(editing.value, { date: form.date, weight, note: form.note.trim() })
+    updateRecord(editedId, { date: form.date, weight, note: form.note.trim() })
   } else {
     // 新增：总是追加一条，同一天可有多条，按录入时间区分
     addRecord(form.date, weight, form.note.trim())
   }
   clearForm()
+  if (isEdit && editedId) flashRow(editedId)
+  showToast(isEdit ? '记录已更新' : uid.value ? '已保存 · 正在云同步' : '已保存（本地模式）')
 }
 
 // 录入时间（时:分），用于区分同日多条记录
@@ -270,29 +290,51 @@ const chart = computed(() => {
   }
 })
 
-const tip = reactive({ show: false, left: 0, top: 0, html: '' })
+const tip = reactive({ show: false, left: 0, top: 0, html: '', pinned: false, key: '' })
 const chartWrap = ref(null)
 function showTip(ev, p) {
   const wrap = chartWrap.value
   if (!wrap) return
   const rect = wrap.getBoundingClientRect()
   const scaleX = rect.width / W, scaleY = rect.height / H
+  // 防溢出：优先放右侧，空间不足翻到左侧；触屏窄屏再贴边兜底不越界
   let left = p.x * scaleX + 10
-  if (left > rect.width - 140) left = p.x * scaleX - 150
+  if (left + 140 > rect.width) left = p.x * scaleX - 150
+  left = Math.max(2, Math.min(left, rect.width - 2))
+  let top = p.y * scaleY - 12
+  if (top + 40 > rect.height) top = rect.height - 42 // 底部快要出界时上移
+  top = Math.max(2, top)
   tip.show = true
   tip.left = left
-  tip.top = p.y * scaleY - 12
+  tip.top = top
 tip.html =
     `<b>${p.r.date}</b>${p.r.ts != null ? ` <span class="tip-ts">${fmtTime(p.r.ts)}</span>` : ''}<br>${p.r.weight.toFixed(1)} kg` +
     (p.r.note ? `<br><span class="tip-note">${esc(p.r.note)}</span>` : '')
 }
+// 点击：同一圆点再点一次关闭；其他圆点切换固定到此点。桌面 hover 仍即时显示
+function toggleTip(ev, p) {
+  if (tip.show && tip.pinned && tip.key === p.r.id) { hideTip(); return }
+  showTip(ev, p)
+  tip.pinned = true
+  tip.key = p.r.id
+}
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 }
-function hideTip() { tip.show = false }
+function hideTip() { tip.show = false; tip.pinned = false; tip.key = '' }
+// hover 移出只在不固定时隐藏；固定（点击）后不因鼠标移出而消失
+function onWrapLeave() { if (!tip.pinned) hideTip() }
+// 点击图表以外任意处，若提示处于固定状态则关闭
+function onDocClick(ev) {
+  if (!tip.show) return
+  const t = ev.target
+  if (t && t.closest && t.closest('.trend-dot')) return // 圆点上的点击交给 toggleTip
+  hideTip()
+}
 
 /* ---------- 初始化 ---------- */
 onMounted(() => {
+  document.addEventListener('click', onDocClick)
   pullAndMerge()
 })
 </script>
@@ -489,7 +531,7 @@ onMounted(() => {
         <h3 class="card-title" style="margin-bottom:0;"><i>📈</i>体重趋势</h3>
         <span class="hint">{{ chart.meta }}</span>
       </div>
-      <div class="chart-wrap" ref="chartWrap" @mouseleave="hideTip">
+      <div class="chart-wrap" ref="chartWrap" @mouseleave="onWrapLeave">
         <svg viewBox="0 0 800 300" role="img" aria-label="体重趋势折线图">
           <defs>
             <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
@@ -515,7 +557,7 @@ onMounted(() => {
             class="trend-dot"
             :cx="p.x" :cy="p.y" r="4.5"
             @mouseenter="showTip($event, p)"
-            @click="showTip($event, p)"
+            @click="toggleTip($event, p)"
           />
         </svg>
         <div class="tip" :hidden="!tip.show" :style="{ left: tip.left + 'px', top: tip.top + 'px' }" v-html="tip.html"></div>
@@ -527,7 +569,7 @@ onMounted(() => {
     <div class="card">
       <h3 class="card-title"><i>☰</i>历史记录 <span class="hint">共 {{ sortedDesc.length }} 条</span></h3>
       <ul class="list" v-if="sortedDesc.length">
-<li class="row" v-for="r in sortedDesc" :key="r.id">
+<li class="row" :class="{ flash: r.id === hlId }" v-for="r in sortedDesc" :key="r.id">
           <div class="row-main">
             <span class="date">{{ r.date }}</span>
             <span class="time" v-if="r.ts != null">{{ fmtTime(r.ts) }}</span>
@@ -551,12 +593,19 @@ onMounted(() => {
         <span>本地缓存：<b>已启用</b></span>
         <span>{{ store.syncMsg }}</span>
       </div>
-      <div class="sb-right" @click="manualSync" :title="store.syncMsg + '（点击重试）'">
+<div class="sb-right" @click="manualSync" :title="store.syncMsg + '（点击重试）'">
         <span class="dot" :class="store.syncState === 'ok' ? 'ok' : store.syncState === 'syncing' ? 'syncing' : store.syncState === 'error' ? 'error' : 'local'"></span>
         <span>{{ syncLabel }}</span>
       </div>
     </div>
   </footer>
+
+  <!-- 保存反馈 toast -->
+  <transition name="toast">
+    <div v-if="toast" class="toast" :class="'toast-' + toast.kind" role="status" aria-live="polite">
+      <span class="toast-check"></span>{{ toast.text }}
+    </div>
+  </transition>
 </template>
 
 <style scoped>
@@ -566,4 +615,11 @@ onMounted(() => {
 .trend-line { fill: none; stroke: var(--primary); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
 .trend-dot { fill: var(--bg-card); stroke: var(--primary); stroke-width: 2; cursor: pointer; transition: r .15s ease; }
 .trend-dot:hover { r: 6; }
+
+/* 编辑保存后对应历史记录行短暂高亮淡出 */
+.row.flash { animation: rowFlash 1.7s ease; }
+@keyframes rowFlash {
+  0%, 55% { background: var(--primary-soft); }
+  100% { background: transparent; }
+}
 </style>

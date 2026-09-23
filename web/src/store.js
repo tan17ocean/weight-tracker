@@ -218,8 +218,13 @@ export const store = state
 export const stats = computed(() => {
   const sorted = sortRecs(state.records)
   if (!sorted.length) return { empty: true, cards: [] }
-  const last = sorted[sorted.length - 1]
-  const prev = sorted.length > 1 ? sorted[sorted.length - 2] : null
+const last = sorted[sorted.length - 1]
+  // 「较上次」以上一个不同日期的记录为基准：同一天多次记录不参与比较，
+  // 避免把早/晚两次测量差误读为「变化」；仅一天数据时 prev 为 null 且不显示该卡片
+  let prev = null
+  for (let i = sorted.length - 2; i >= 0; i--) {
+    if (sorted[i].date !== last.date) { prev = sorted[i]; break }
+  }
   const first = sorted[0]
 
   const avgBetween = (startStr) => {
