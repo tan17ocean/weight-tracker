@@ -2,7 +2,7 @@
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import './styles/main.css'
 import {
-  store, stats, progress, syncLabel,
+  store, stats, progress, syncLabel, unitLabel, dispKg,
   pushRemote, pullAndMerge,
   getUserId, switchUser, uidPersisted,
   addRecord, updateRecord, deleteRecord, saveSettings, exportData, sortRecs
@@ -78,7 +78,7 @@ const editingLabel = computed(() => {
   if (!editing.value) return ''
   const r = store.records.find((x) => x.id === editing.value)
   if (!r) return ''
-  return `${r.date}${r.ts != null ? ' ' + fmtTime(r.ts) : ''}（${r.weight.toFixed(1)} kg）`
+  return `${r.date}${r.ts != null ? ' ' + fmtTime(r.ts) : ''}（${dispKg(r.weight).toFixed(1)} ${unitLabel.value}）`
 })
 
 function startEdit(id) {
@@ -94,7 +94,7 @@ function startEdit(id) {
 function delRecord(id) {
   const r = store.records.find((x) => x.id === id)
   if (!r) return
-  if (!confirm(`确定删除 ${r.date}${r.ts != null ? ' ' + fmtTime(r.ts) : ''} 的这条记录（${r.weight.toFixed(1)} kg）吗？`)) return
+  if (!confirm(`确定删除 ${r.date}${r.ts != null ? ' ' + fmtTime(r.ts) : ''} 的这条记录（${dispKg(r.weight).toFixed(1)} ${unitLabel.value}）吗？`)) return
   deleteRecord(id)
 }
 
@@ -116,6 +116,13 @@ function saveGoalHeight() {
   if (settings.height !== '' && !(h >= 80 && h <= 250)) { alert('身高无效（80 - 250 cm）'); return }
   saveSettings(settings.goal === '' ? null : g, settings.height === '' ? null : h)
   alert('设置已保存')
+}
+
+// 单位切换：仅展示换算，存储始终 kg
+function setUnit(u) {
+  if (u === store.unit) return
+  saveSettings(store.goal, store.height, u)
+  showToast('已切换为 ' + (u === 'lb' ? '磅（lb）' : '千克（kg）') + ' 显示')
 }
 
 /* ---------- 减肥进度：目标体重内联编辑 ---------- */
@@ -144,7 +151,7 @@ const progDoneCls = computed(() => {
 const progDoneText = computed(() => {
   if (!progress.value) return ''
   const sign = progress.value.done >= 0 ? '+' : '-'
-  return `${sign}${Math.abs(progress.value.done).toFixed(1)} kg`
+  return `${sign}${Math.abs(dispKg(progress.value.done)).toFixed(1)} ${unitLabel.value}`
 })
 function startGoalEdit() {
   editingGoal.value = true
@@ -227,8 +234,24 @@ const sortedDesc = computed(() => sortRecs(store.records).reverse())
 const W = 800, H = 300
 const M = { t: 20, r: 20, b: 32, l: 46 }
 const DAY_MS = 86400000
+// 时间范围：all=全部 90=近90天 30=近30天
+const chartRange = ref('all')
+const chartRanges = [
+  { v: 'all', label: '全部' },
+  { v: '90', label: '90 天' },
+  { v: '30', label: '30 天' }
+]
+function filterByRange(sorted) {
+  if (chartRange.value === 'all') return sorted
+  const n = chartRange.value === '90' ? 89 : 29
+  const cut = new Date(); cut.setDate(cut.getDate() - n)
+  const cutStr = fmt(cut)
+  return sorted.filter((r) => r.date >= cutStr)
+}
 const chart = computed(() => {
-  const sorted = sortRecs(store.records)
+  const all = sortRecs(store.records)
+  if (!all.length) return { empty: true }
+  const sorted = filterByRange(all)
   if (!sorted.length) return { empty: true }
   // 同一日期多条记录：单条用真实录入时刻，多条按当天时间均匀展开，避免点重叠
   const groups = new Map()
@@ -253,7 +276,7 @@ const chart = computed(() => {
   const gridLines = []
   for (let i = 0; i <= 4; i++) {
     const wv = minW + (maxW - minW) * i / 4
-    gridLines.push({ y: Y(wv), label: wv.toFixed(1) })
+    gridLines.push({ y: Y(wv), label: dispKg(wv).toFixed(1) })
   }
   const xLabels = []
   const idxs = [0, Math.floor((sorted.length - 1) / 2), sorted.length - 1]
@@ -264,15 +287,36 @@ const chart = computed(() => {
     seenX[xx.toFixed(0)] = true
     xLabels.push({ x: xx, text: sorted[i0].date.slice(5) })
   }
-  const goalLine = store.goal !== null ? { y: Y(store.goal), label: `目标 ${store.goal} kg`, inRange: Y(store.goal) >= M.t - 8 && Y(store.goal) <= H - M.b + 8 } : null
+  const goalLine = store.goal !== null ? { y: Y(store.goal), label: `目标 ${dispKg(store.goal).toFixed(1)} ${unitLabel.value}`, inRange: Y(store.goal) >= M.t - 8 && Y(store.goal) <= H - M.b + 8 } : null
 
   const pts = sorted.map((r, j) => ({ x: X(ms[j]), y: Y(r.weight), r }))
   const lineD = 'M' + pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L')
   const areaD = `${lineD} L${pts[pts.length - 1].x.toFixed(1)},${H - M.b} L${pts[0].x.toFixed(1)},${H - M.b} Z`
 
+  // 7 天移动平均：按日期聚合取均值 → 以每个日期为窗口终点，向前取至多 7 天有记录的日均值求平均
+  let maD = ''
+  if (groups.size >= 2) {
+    const days = [...groups.entries()]
+      .map(([date, recs]) => {
+        const avg = recs.reduce((s, r) => s + r.weight, 0) / recs.length
+        return { t: new Date(date + 'T00:00:00').getTime() + DAY_MS / 2, w: avg }
+      })
+      .sort((a, b) => a.t - b.t)
+    if (days.length >= 2) {
+      const ma = days.map((d, i) => {
+        const from = Math.max(0, i - 6)
+        let s = 0
+        for (let k = from; k <= i; k++) s += days[k].w
+        return { x: X(d.t), y: Y(s / (i - from + 1)) }
+      })
+      maD = 'M' + ma.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L')
+    }
+  }
+
+  const rangeLabel = chartRange.value === '90' ? '近 90 天' : chartRange.value === '30' ? '近 30 天' : '全部'
   return {
-    empty: false, pts, lineD, areaD, gridLines, xLabels, goalLine,
-    meta: `共 ${sorted.length} 条 · ${sorted[0].date} 至 ${sorted[sorted.length - 1].date}`
+    empty: false, pts, lineD, areaD, maD, gridLines, xLabels, goalLine,
+    meta: `共 ${sorted.length} 条（${rangeLabel}）· ${sorted[0].date} 至 ${sorted[sorted.length - 1].date}${groups.size >= 2 ? ' · 虚线为 7 天均值' : ''}`
   }
 })
 
@@ -294,7 +338,7 @@ function showTip(ev, p) {
   tip.left = left
   tip.top = top
 tip.html =
-    `<b>${p.r.date}</b>${p.r.ts != null ? ` <span class="tip-ts">${fmtTime(p.r.ts)}</span>` : ''}<br>${p.r.weight.toFixed(1)} kg` +
+    `<b>${p.r.date}</b>${p.r.ts != null ? ` <span class="tip-ts">${fmtTime(p.r.ts)}</span>` : ''}<br>${dispKg(p.r.weight).toFixed(1)} ${unitLabel.value}` +
     (p.r.note ? `<br><span class="tip-note">${esc(p.r.note)}</span>` : '')
 }
 // 点击：同一圆点再点一次关闭；其他圆点切换固定到此点。桌面 hover 仍即时显示
@@ -381,7 +425,7 @@ onMounted(() => {
           </div>
         </form>
 
-        <details>
+<details>
           <summary>目标与身体参数</summary>
           <div class="setting-body">
             <div class="field">
@@ -391,6 +435,13 @@ onMounted(() => {
             <div class="field">
               <label for="inHeight">身高（cm）</label>
               <input type="number" id="inHeight" v-model="settings.height" min="80" max="250" step="0.5" placeholder="用于 BMI 计算">
+            </div>
+            <div class="field">
+              <label>显示单位（仅展示换算，数据始终存 kg）</label>
+              <div class="unit-row">
+                <label class="unit-opt"><input type="radio" name="unit" :checked="unitLabel === 'kg'" @change="setUnit('kg')"> 千克（kg）</label>
+                <label class="unit-opt"><input type="radio" name="unit" :checked="unitLabel === 'lb'" @change="setUnit('lb')"> 磅（lb）</label>
+              </div>
             </div>
             <div><button class="btn small" @click="saveGoalHeight">保存设置</button></div>
           </div>
@@ -418,9 +469,9 @@ onMounted(() => {
         <h3 class="card-title"><i>📊</i>统计</h3>
         <div class="stats">
           <template v-if="!stats.empty">
-            <div class="stat" v-for="c in stats.cards" :key="c.label">
+<div class="stat" v-for="c in stats.cards" :key="c.label">
               <div class="stat-label">{{ c.label }}</div>
-              <div class="stat-value" :class="c.cls || ''">{{ c.value }}<span v-if="c.unit" class="unit">{{ c.unit }}</span></div>
+              <div class="stat-value" :class="c.cls || ''">{{ c.value }}</div>
               <div class="stat-hint" v-if="c.hint">{{ c.hint }}</div>
             </div>
           </template>
@@ -438,7 +489,7 @@ onMounted(() => {
         <h3 class="card-title" style="margin-bottom:0;"><i>🎯</i>减肥进度</h3>
         <div class="prog-goal" v-if="hasGoalSet">
           <template v-if="!editingGoal">
-            <span class="prog-goal-num">目标 <b>{{ store.goal }}</b> kg</span>
+            <span class="prog-goal-num">目标 <b>{{ dispKg(store.goal).toFixed(1) }}</b> {{ unitLabel }}</span>
             <button class="btn small" @click="startGoalEdit">修改</button>
           </template>
           <template v-else>
@@ -450,10 +501,10 @@ onMounted(() => {
         <button class="btn small" v-else @click="startGoalEdit">设置目标体重</button>
       </div>
 
-      <div v-if="progress.empty || !hasGoalSet" class="prog-empty">
+<div v-if="progress.empty || !hasGoalSet" class="prog-empty">
         <template v-if="progress.empty">还没有记录，先添加第一条体重记录，再设置目标即可查看进度。</template>
         <template v-else>
-          目标体重未设置。设置后即可查看减肥进度。当前体重 <b>{{ progress.cur.toFixed(1) }}</b> kg。
+          目标体重未设置。设置后即可查看减肥进度。当前体重 <b>{{ dispKg(progress.cur).toFixed(1) }}</b> {{ unitLabel }}。
         </template>
         <div v-if="editingGoal && !hasGoalSet" class="prog-inline">
           <input type="number" id="inGoalInline" v-model="goalInput" min="20" max="300" step="0.1" placeholder="目标体重（kg）" @keyup.enter="saveGoal">
@@ -469,23 +520,23 @@ onMounted(() => {
             <span class="prog-pct">{{ Math.round(pctClamped) }}%</span>
           </div>
         </div>
-        <div class="prog-meta">
+<div class="prog-meta">
           <div class="prog-point">
             <span class="prog-label">起始</span>
-            <span class="prog-val">{{ progress.start.toFixed(1) }}</span>
-            <span class="prog-unit">kg</span>
+            <span class="prog-val">{{ dispKg(progress.start).toFixed(1) }}</span>
+            <span class="prog-unit">{{ unitLabel }}</span>
           </div>
           <div class="prog-arrow">→</div>
           <div class="prog-point">
             <span class="prog-label">当前</span>
-            <span class="prog-val">{{ progress.cur.toFixed(1) }}</span>
-            <span class="prog-unit">kg</span>
+            <span class="prog-val">{{ dispKg(progress.cur).toFixed(1) }}</span>
+            <span class="prog-unit">{{ unitLabel }}</span>
           </div>
           <div class="prog-arrow">→</div>
           <div class="prog-point">
             <span class="prog-label">目标</span>
-            <span class="prog-val" :class="{ done: progress.reached }">{{ store.goal }}</span>
-            <span class="prog-unit">kg</span>
+            <span class="prog-val" :class="{ done: progress.reached }">{{ dispKg(store.goal).toFixed(1) }}</span>
+            <span class="prog-unit">{{ unitLabel }}</span>
           </div>
         </div>
         <div class="prog-stats">
@@ -493,26 +544,34 @@ onMounted(() => {
             <span class="prog-stat-label">状态</span>
             <span class="prog-badge done">🎉 目标已达成</span>
           </div>
+          <div class="prog-stat" v-if="progress.eta">
+            <span class="prog-stat-label">预计达标</span>
+            <span class="prog-stat-num eta">{{ progress.eta.days >= 60 ? progress.eta.date : '约 ' + progress.eta.days + ' 天后' }}</span>
+            <span class="prog-stat-hint">按当前趋势外推 · {{ progress.eta.date }}</span>
+          </div>
           <div class="prog-stat">
             <span class="prog-stat-label">{{ progress.direction === 'lose' ? '已减' : progress.direction === 'gain' ? '已增' : '变动' }}</span>
             <span class="prog-stat-num" :class="progDoneCls">{{ progDoneText }}</span>
           </div>
           <div class="prog-stat" v-if="!progress.reached">
             <span class="prog-stat-label">{{ progress.direction === 'lose' ? '还需减重' : progress.direction === 'gain' ? '还需增重' : '仍偏离' }}</span>
-            <span class="prog-stat-num">{{ progress.need.toFixed(1) }} kg</span>
+            <span class="prog-stat-num">{{ dispKg(progress.need).toFixed(1) }} {{ unitLabel }}</span>
           </div>
           <div class="prog-stat" v-else>
             <span class="prog-stat-label">超额</span>
-            <span class="prog-stat-num down">{{ over.toFixed(1) }} kg</span>
+            <span class="prog-stat-num down">{{ dispKg(over).toFixed(1) }} {{ unitLabel }}</span>
           </div>
         </div>
       </template>
     </div>
 
     <!-- 趋势图 -->
-    <div class="card" v-if="!chart.empty">
+<div class="card" v-if="!chart.empty">
       <div class="chart-head">
         <h3 class="card-title" style="margin-bottom:0;"><i>📈</i>体重趋势</h3>
+        <div class="chart-ranges">
+          <button v-for="r in chartRanges" :key="r.v" class="range-btn" :class="{ on: chartRange === r.v }" @click="chartRange = r.v">{{ r.label }}</button>
+        </div>
         <span class="hint">{{ chart.meta }}</span>
       </div>
       <div class="chart-wrap" ref="chartWrap" @mouseleave="onWrapLeave">
@@ -535,6 +594,7 @@ onMounted(() => {
             <text :x="W - M.r - 2" :y="chart.goalLine.y - 6" text-anchor="end" font-size="11" fill="var(--red)">{{ chart.goalLine.label }}</text>
           </g>
           <path :d="chart.areaD" fill="url(#areaGrad)" stroke="none"/>
+          <path :d="chart.maD" class="trend-ma" v-if="chart.maD"/>
           <path class="trend-line" :d="chart.lineD"/>
 <circle
             v-for="p in chart.pts" :key="p.r.id"
@@ -558,7 +618,7 @@ onMounted(() => {
             <span class="date">{{ r.date }}</span>
             <span class="time" v-if="r.ts != null">{{ fmtTime(r.ts) }}</span>
             <span class="rel" v-if="relLabel(r.date)">{{ relLabel(r.date) }}</span>
-            <span class="weight">{{ r.weight.toFixed(1) }} kg</span>
+            <span class="weight">{{ dispKg(r.weight).toFixed(1) }} {{ unitLabel }}</span>
             <span class="note" v-if="r.note" :title="r.note">{{ r.note }}</span>
           </div>
           <div class="row-ops">
@@ -597,8 +657,19 @@ onMounted(() => {
 .grid-line line { stroke: var(--border); stroke-width: 1; }
 .goal-line { stroke: var(--red); stroke-dasharray: 6 4; stroke-width: 1.5; opacity: .75; }
 .trend-line { fill: none; stroke: var(--primary); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.trend-ma { fill: none; stroke: var(--primary-2, #f2a33c); stroke-width: 1.8; stroke-dasharray: 5 4; opacity: .8; stroke-linejoin: round; stroke-linecap: round; }
 .trend-dot { fill: var(--bg-card); stroke: var(--primary); stroke-width: 2; cursor: pointer; transition: r .15s ease; }
 .trend-dot:hover { r: 6; }
+.chart-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.chart-ranges { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.range-btn { border: none; background: transparent; color: var(--text-muted); font-size: 12px; padding: 3px 11px; cursor: pointer; transition: background .15s, color .15s; }
+.range-btn + .range-btn { border-left: 1px solid var(--border); }
+.range-btn.on { background: var(--primary-soft, rgba(64, 128, 255, .15)); color: var(--primary); font-weight: 600; }
+.unit-row { display: flex; flex-wrap: wrap; gap: 14px; padding: 4px 0 8px; }
+.unit-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); cursor: pointer; }
+.unit-opt input { accent-color: var(--primary); }
+.prog-stat-hint { display: block; font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.prog-stat-num.eta { color: var(--primary); }
 
 /* 编辑保存后对应历史记录行短暂高亮淡出 */
 .row.flash { animation: rowFlash 1.7s ease; }

@@ -54,7 +54,9 @@ export function normalize(d) {
   return {
     records: recs,
     goal: d && typeof d.goal === 'number' && d.goal > 0 ? d.goal : null,
-    height: d && typeof d.height === 'number' && d.height > 0 ? d.height : null
+    height: d && typeof d.height === 'number' && d.height > 0 ? d.height : null,
+    // 显示单位：'kg' | 'lb'，仅展示换算，存储始终为 kg；旧数据无该字段时为 null（按 kg 处理）
+    unit: d && (d.unit === 'kg' || d.unit === 'lb') ? d.unit : null
   }
 }
 
@@ -80,10 +82,12 @@ function mergeRecords(cur, incoming) {
 }
 
 function mergeData(local, remote) {
+  // unit 属展示偏好：本地已设置则优先本地，否则取远端（远端任务数据文件中可能保存了用户偏好）
   return {
     records: mergeRecords(local.records, remote.records),
     goal: local.goal || remote.goal,
-    height: local.height || remote.height
+    height: local.height || remote.height,
+    unit: (local.unit === 'lb' || remote.unit === 'lb') ? 'lb' : 'kg'
   }
 }
 
@@ -174,6 +178,7 @@ export function switchUser(uid) {
   state.records = data.records
   state.goal = data.goal
   state.height = data.height
+  state.unit = data.unit || 'kg'
   return safe
 }
 
@@ -201,10 +206,10 @@ function loadLocal(allowLegacy) {
   if (raw) {
     try { return normalize(JSON.parse(raw)) } catch (e) { /* ignore */ }
   }
-  return { records: [], goal: null, height: null }
+  return { records: [], goal: null, height: null, unit: 'kg' }
 }
 function saveLocal() {
-  try { localStorage.setItem(localKey(), JSON.stringify({ records: state.records, goal: state.goal, height: state.height })) } catch (e) { /* ignore */ }
+  try { localStorage.setItem(localKey(), JSON.stringify({ records: state.records, goal: state.goal, height: state.height, unit: state.unit })) } catch (e) { /* ignore */ }
 }
 
 /* ---------- 响应式状态 ---------- */
@@ -215,6 +220,15 @@ const state = reactive({
 })
 
 export const store = state
+
+/* ---------- 单位换算（仅展示，存储始终为 kg） ---------- */
+const LB_PER_KG = 2.2046226218
+export const unitLabel = computed(() => (state.unit === 'lb' ? 'lb' : 'kg'))
+// kg 值 → 按当前显示单位换算后的数值，仅用于展示
+export function dispKg(v) {
+  return state.unit === 'lb' ? v * LB_PER_KG : v
+}
+const fmtKg = (v) => `${dispKg(v).toFixed(1)} ${unitLabel.value}`
 
 export const stats = computed(() => {
   const sorted = sortRecs(state.records)
@@ -233,10 +247,10 @@ const last = sorted[sorted.length - 1]
     if (!list.length) return null
     return list.reduce((s, r) => s + r.weight, 0) / list.length
   }
-  const fmtDiff = (d) => {
+const fmtDiff = (d) => {
     if (d === null || d === undefined || !isFinite(d)) return '--'
     const sign = d > 0 ? '+' : ''
-    return `${sign}${d.toFixed(1)} kg`
+    return `${sign}${dispKg(d).toFixed(1)} ${unitLabel.value}`
   }
 
   const d6 = new Date(); d6.setDate(d6.getDate() - 6)
@@ -248,7 +262,7 @@ const last = sorted[sorted.length - 1]
   const minW = Math.min(...ws)
 
 const cards = []
-  cards.push({ label: '当前体重', value: last.weight.toFixed(1), unit: 'kg', hint: `更新于 ${last.date.slice(5)}${last.ts != null ? ' ' + fmtTime(last.ts) : ''}` })
+  cards.push({ label: '当前体重', value: fmtKg(last.weight), hint: `更新于 ${last.date.slice(5)}${last.ts != null ? ' ' + fmtTime(last.ts) : ''}` })
   if (prev) {
     const dLast = last.weight - prev.weight
     cards.push({
@@ -261,9 +275,9 @@ const cards = []
     label: '较起始变化', value: fmtDiff(dStart), hint: `起始 ${first.date.slice(5)}`,
     cls: dStart > 0 ? 'up' : dStart < 0 ? 'down' : ''
   })
-  if (avg7 !== null) cards.push({ label: '近 7 天均值', value: avg7.toFixed(1), unit: 'kg' })
-  if (avg30 !== null) cards.push({ label: '近 30 天均值', value: avg30.toFixed(1), unit: 'kg' })
-  cards.push({ label: '最高 / 最低', value: `${maxW.toFixed(1)} / ${minW.toFixed(1)}`, unit: 'kg' })
+  if (avg7 !== null) cards.push({ label: '近 7 天均值', value: fmtKg(avg7) })
+  if (avg30 !== null) cards.push({ label: '近 30 天均值', value: fmtKg(avg30) })
+  cards.push({ label: '最高 / 最低', value: `${fmtKg(maxW)} / ${fmtKg(minW)}` })
   if (state.height) {
     const h = state.height / 100
     const bmi = last.weight / (h * h)
@@ -274,22 +288,53 @@ const cards = []
     const left = last.weight - state.goal
     cards.push(
       left > 0
-        ? { label: '距目标', value: left.toFixed(1), unit: 'kg', hint: `目标 ${state.goal}，还需减重`, cls: 'up' }
-        : { label: '距目标', value: '达成', hint: `目标 ${state.goal} kg 已达成`, cls: 'ok' }
+        ? { label: '距目标', value: fmtKg(left), hint: `目标 ${fmtKg(state.goal)}，还需减重`, cls: 'up' }
+        : { label: '距目标', value: '达成', hint: `目标 ${fmtKg(state.goal)} 已达成`, cls: 'ok' }
     )
   }
   return { empty: false, cards, sorted }
 })
 
 /* ---------- 减肥进度 ---------- */
+// 达标时间预估：对全部记录做最小二乘线性回归（x=距离首条的天数, y=体重kg），
+// 用当前斜率外推还需减/增多少天可达目标；斜率方向不对（在往反方向走）或样本过少时返回 null。
+const DAY_MS = 86400000
+function estimateEta(records, start, cur, goal, direction) {
+  if (records.length < 3) return null
+  const sorted = sortRecs(records)
+  const t0 = new Date(sorted[0].date + 'T00:00:00').getTime()
+  let sx = 0, sy = 0, sxy = 0, sxx = 0, n = 0
+  for (const r of sorted) {
+    const x = (new Date(r.date + 'T00:00:00').getTime() - t0) / DAY_MS
+    if (!isFinite(x)) continue
+    const y = r.weight
+    sx += x; sy += y; sxy += x * y; sxx += x * x; n++
+  }
+  if (n < 2) return null
+  const denom = n * sxx - sx * sx
+  if (!denom) return null
+  const slope = (n * sxy - sx * sy) / denom // kg/天
+  if (!isFinite(slope) || Math.abs(slope) < 0.001) return null
+  // 斜率方向必须与目标方向一致：减重需 slope<0，增重需 slope>0
+  if (direction === 'lose' && slope >= 0) return null
+  if (direction === 'gain' && slope <= 0) return null
+  const need = direction === 'lose' ? cur - goal : goal - cur
+  if (need <= 0) return null
+  const days = Math.ceil(need / Math.abs(slope))
+  if (days > 36500) return null // 过于久远视为不可预估
+  const last = new Date(sorted[sorted.length - 1].date + 'T00:00:00')
+  last.setDate(last.getDate() + days)
+  return { days, date: fmtDate(last) }
+}
+
 export const progress = computed(() => {
   const sorted = sortRecs(state.records)
-  if (!sorted.length) return { empty: true, hasGoal: !!state.goal, goal: state.goal, cur: null, start: null, pct: 0, done: 0, need: 0, reached: false, direction: 'keep' }
+  if (!sorted.length) return { empty: true, hasGoal: !!state.goal, goal: state.goal, cur: null, start: null, pct: 0, done: 0, need: 0, reached: false, direction: 'keep', eta: null }
   const start = sorted[0].weight
   const cur = sorted[sorted.length - 1].weight
   const goal = state.goal
   if (goal === null) {
-    return { empty: false, hasGoal: false, goal: null, cur, start, pct: 0, done: start - cur, need: 0, reached: false, direction: 'keep' }
+    return { empty: false, hasGoal: false, goal: null, cur, start, pct: 0, done: start - cur, need: 0, reached: false, direction: 'keep', eta: null }
   }
   const direction = goal < start ? 'lose' : goal > start ? 'gain' : 'keep'
   const total = Math.abs(start - goal)
@@ -305,7 +350,8 @@ export const progress = computed(() => {
   const reached = direction !== 'keep'
     ? (direction === 'lose' ? cur <= goal : cur >= goal)
     : Math.abs(done) < 0.05
-  return { empty: false, hasGoal: true, goal, cur, start, pct, done, need: Math.max(0, total - Math.abs(done)), reached, direction }
+  const eta = reached ? null : estimateEta(sorted, start, cur, goal, direction)
+  return { empty: false, hasGoal: true, goal, cur, start, pct, done, need: Math.max(0, total - Math.abs(done)), reached, direction, eta }
 })
 
 /* ---------- 同步状态 ---------- */
@@ -337,7 +383,7 @@ function fetchRemote() {
       // Worker 约定：文件不存在时返回 { exists:false, records:[], goal:null, height:null }
       if (!j || !j.exists) return null
       // sha 为该文件当前版本（乐观并发基准），供并发写保护使用
-      return { records: j.records || [], goal: j.goal ?? null, height: j.height ?? null, sha: j.sha || '' }
+      return { records: j.records || [], goal: j.goal ?? null, height: j.height ?? null, unit: j.unit || 'kg', sha: j.sha || '' }
     })
 }
 
@@ -369,7 +415,7 @@ export function pushRemote() {
       return res.json()
     })
     .then((j) => {
-      let payload = { records: state.records, goal: state.goal, height: state.height }
+      let payload = { records: state.records, goal: state.goal, height: state.height, unit: state.unit }
       if (!j || !j.exists) {
         if (uid === firstUser()) {
           return fetch(CFG.legacyRaw, { cache: 'no-store' })
@@ -457,11 +503,12 @@ export function pullAndMerge() {
       }
       setBaseSha(remote.sha) // 记录远端版本，供本次后续写入作为并发基准
       const rn = normalize(remote)
-      const merged = mergeData({ records: state.records, goal: state.goal, height: state.height }, rn)
-      const changed = !dataEq(merged, { records: state.records, goal: state.goal, height: state.height })
+      const merged = mergeData({ records: state.records, goal: state.goal, height: state.height, unit: state.unit }, rn)
+      const changed = !dataEq(merged, { records: state.records, goal: state.goal, height: state.height, unit: state.unit })
       state.records = merged.records
       state.goal = merged.goal
       state.height = merged.height
+      state.unit = merged.unit || 'kg'
       saveLocal()
       const localExtra = state.records.length > rn.records.length
       if (changed || localExtra || ((state.goal || state.height) && !rn.goal && !rn.height)) {
@@ -502,9 +549,10 @@ export function deleteRecord(id) {
   pushRemote()
 }
 
-export function saveSettings(goal, height) {
+export function saveSettings(goal, height, unit) {
   state.goal = goal
   state.height = height
+  if (unit === 'kg' || unit === 'lb') state.unit = unit
   saveLocal()
   pushRemote()
 }
